@@ -1,0 +1,35 @@
+services:
+  vsoc:
+    build: .
+    ports:
+      - "8000:8000"   # FastAPI backend
+      - "8501:8501"   # Streamlit dashboard
+    volumes:
+      # Mount dataset directory from host (you copy the Car Hacking CSVs here)
+      - ./data/raw:/app/data/raw:ro
+      - ./models:/app/models
+      - ./data/audit.db:/app/data/audit.db
+    environment:
+      - APP_ENV=development
+      - APP_HOST=0.0.0.0
+      - APP_PORT=8000
+      - DEBUG=true
+      - SECRET_KEY=${SECRET_KEY:-change-me-in-production-min-32-chars}
+      - ENCRYPTION_KEY=${ENCRYPTION_KEY:-change-me-in-production-32-bytes-base64}
+      - TOKEN_ROTATION_INTERVAL_HOURS=24
+      - TOKEN_SECRET=${TOKEN_SECRET:-change-me-token-secret}
+      - LOCATION_MINIMIZATION_LEVEL=coarsen
+      - LOCATION_GRID_SIZE_KM=1
+      - UNAMASK_REQUEST_TTL_MINUTES=30
+      - REQUIRED_APPROVERS=2
+      - AUDIT_DB_PATH=/app/data/audit.db
+      - AUDIT_HASH_CHAIN_ENABLED=true
+      - DATASET_DIR=/app/data/raw
+      - MODEL_DIR=/app/models
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s

@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+.venv/
+env/
+.env
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+.coverage.*
+*.log
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Data / models
+data/*.csv
+data/*.txt
+data/*.7z
+data/*.zip
+models/*.pkl
+models/*.joblib
+*.db
+*.sqlite
+*.sqlite3
+
+# Docker
+.dockerignore
+
+# Streamlit
+.streamlit/secrets.toml

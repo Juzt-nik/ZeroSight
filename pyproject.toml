@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "privacy-native-vsoc"
+version = "0.1.0"
+description = "Privacy-native vSOC for Connected Vehicles - IBM Z Datathon 2026"
+requires-python = ">=3.11"
+
+[project.scripts]
+verify-audit = "scripts.verify_audit:main"
+seed-demo = "scripts.seed_demo:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["backend*", "detection*", "privacy*", "access_control*", "audit*", "anomaly_detection*", "scripts*"]
