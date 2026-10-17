@@ -52,6 +52,10 @@ class DetectionResult(BaseModel):
     model_version: str
     timestamp: datetime
     vehicle_token: Optional[str] = None
+    inference_latency_ms: Optional[float] = Field(
+        default=None, ge=0,
+        description="Server-side predict_window call duration in milliseconds, including any model-lock wait",
+    )
 
     model_config = {"protected_namespaces": ()}
 

@@ -42,11 +42,42 @@ Appendix A/D requirements.
 
 ---
 
-## Measured Results
+## P1 Final Integration Capability Matrix
 
-No load-test results have been recorded against integrated endpoints yet.
-Run `python tests/load/loadtest.py` against a deployed instance to generate
-baseline throughput and latency measurements.
+| Capability | Implemented | Tested | Simulated | Planned | Evidence / boundary |
+|---|---|---|---|---|---|
+| Streamlit auth and seven scenes | Yes | Regression coverage exists; not run in this pass | Demo-mode bearer principal is simulated | — | Bearer sent on protected calls; `/access/me` resolves principal (`frontend/streamlit_app.py`) |
+| Detection inference timing | Yes | Existing detection regression coverage; not run in this pass | — | — | `inference_latency_ms` is model-call duration (`backend/routes/detection.py`) |
+| Authenticated load runner | Yes | Not run in this pass | Unlabeled synthetic probe only when no fixture supplied | Capture deployed run | `/detect`, JSONL labels enable per-attack metrics and FPR (`tests/load/loadtest.py`) |
+| Audit tamper scene | Yes | API regression coverage exists; not run in this pass | Tamper action is deliberately destructive simulation | — | Use a disposable database (`docs/demo-script.md`) |
+| Phase 3 audit/anomaly integration | Yes | Regression tests exist; not run in this pass | Demo event recording is available | — | Audit event listener, startup replay, provenance, self-only attribution (`docs/api-contracts.md`) |
+| Fallback demo video | — | — | — | Capture and store | Shot list prepared; no video artifact is present (`docs/demo-script.md`) |
+| Live CAN, OIDC, HSM, IBM Z hardware features | — | — | — | External integration | Not implemented by this phase; see component table above |
+
+No measured performance result is claimed until the authenticated load run is
+executed. The load runner distinguishes backend inference time from client
+HTTP round-trip time. It reports per-attack metrics and false-positive rate
+only when input JSONL contains ground-truth labels.
+
+## Phase 3 Completion
+
+Phase 3 audit/anomaly integration is implemented:
+
+- Attack alert audit records include the model version and feature schema version.
+- Audit events are passed to the anomaly detector after persistence.
+- Startup replays up to 10,000 recent audit records to rebuild in-memory anomaly history.
+- The anomaly event endpoint only accepts events attributed to the authenticated caller.
+- Regression tests cover attack-to-audit metadata, audit-driven anomaly rules,
+  startup replay, and cross-user spoof rejection (`tests/test_detection_audit_integration.py`,
+  `tests/test_audit_anomaly_integration.py`, `tests/test_startup_audit_replay.py`,
+  `tests/test_anomaly_route_security.py`).
+- The Streamlit anomaly scene can record an event for the signed-in caller and
+  load warnings (`frontend/streamlit_app.py`).
+
+The endpoints remain available for follow-on work. Remaining work is operational:
+execute the full test suite, capture the deployed load metrics and fallback video,
+and decide whether anomaly history needs a longer replay window or durable storage
+beyond the audit database. No Phase 3 stub routes are used.
 
 ---
 
