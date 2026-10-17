@@ -121,13 +121,19 @@ app.add_middleware(
 
 @app.get("/health", tags=["system"])
 async def health():
-    """Health check endpoint."""
+    """Health check endpoint.
+    
+    Reports unhealthy when required services (model, audit) are unavailable.
+    """
+    model_ok = model_service is not None and model_service.is_loaded()
+    audit_ok = audit_service is not None
+    all_ok = model_ok and audit_ok
     return {
-        "status": "healthy",
+        "status": "healthy" if all_ok else "unhealthy",
         "service": "privacy-native-vsoc",
         "version": "0.1.0",
-        "model_loaded": model_service is not None and model_service.is_loaded(),
-        "audit_initialized": audit_service is not None,
+        "model_loaded": model_ok,
+        "audit_initialized": audit_ok,
     }
 
 

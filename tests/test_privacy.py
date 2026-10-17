@@ -170,10 +170,10 @@ def test_vault_access_granted_with_permission(monkeypatch):
 
 
 def test_expired_request_remasks_identity():
-    """Phase 2: When a request expires, the identity is removed from the vault."""
+    """Phase 2: When a request expires, the grant is revoked but identity mapping is preserved."""
     service = _new_unmasking_service()
     service.register_identity("TOKEN-RE-MASK", "REAL-VIN-RE-MASK")
-    assert "REAL-VIN-RE-MASK" == service._identity_map.get("TOKEN-RE-MASK")
+    assert "REAL-VIN-RE-MASK" == service._token_vault.get("TOKEN-RE-MASK")
 
     record = service.create_request(
         "TOKEN-RE-MASK", "Valid investigation purpose", "sec_officer_1"
@@ -181,11 +181,11 @@ def test_expired_request_remasks_identity():
     # Force expiry
     record.expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
 
-    # Accessing the request triggers _expire_if_needed → re-masking
+    # Accessing the request triggers _expire_if_needed → grant revoked
     service.get_request(record.request_id)
 
-    # Identity should be removed from vault after expiry
-    assert service._identity_map.get("TOKEN-RE-MASK") is None
+    # Identity mapping is PRESERVED after expiry (only the grant is revoked)
+    assert service._token_vault.get("TOKEN-RE-MASK") == "REAL-VIN-RE-MASK"
 
 
 def test_re_mask_token_requires_vault_write():
@@ -200,14 +200,14 @@ def test_re_mask_token_requires_vault_write():
     assert service.re_mask_token("TOKEN-WRITE", requesting_user=analyst) is False
 
     # Identity should still be present
-    assert service._identity_map.get("TOKEN-WRITE") == "REAL-VIN-WRITE"
+    assert service._token_vault.get("TOKEN-WRITE") == "REAL-VIN-WRITE"
 
     # Security officer has vault:write permission
     officer = UserContext(user_id="officer", roles={"security_officer"})
     assert service.re_mask_token("TOKEN-WRITE", requesting_user=officer) is True
 
-    # Identity should be removed
-    assert service._identity_map.get("TOKEN-WRITE") is None
+    # Identity should be removed after explicit re-mask
+    assert service._token_vault.get("TOKEN-WRITE") is None
 
 
 def test_analyst_cannot_retrieve_vin_through_vault(monkeypatch):

@@ -17,6 +17,7 @@ from backend.services.access_control import (
     AccessControlService,
     access_control as default_access_control,
 )
+from backend.services.tokenization import _token_vault, _token_vault_lock
 
 logger = logging.getLogger("vsoc.unmasking")
 
@@ -101,8 +102,8 @@ class UnmaskingService:
         self.required_approvers = required_approvers
         self.access_control = access_control_service or default_access_control
         self._requests: Dict[str, UnmaskRequestRecord] = {}
-        # This mapping is isolated from regular request/alert processing.
-        self._identity_map: Dict[str, str] = {}
+        # Use the shared token vault from tokenization.py (Phase 2: unified storage)
+        self._token_vault = _token_vault
         self._lock = RLock()
 
     def register_identity(self, vehicle_token: str, real_identity: str) -> None:
@@ -110,7 +111,7 @@ class UnmaskingService:
         if not vehicle_token.strip() or not real_identity.strip():
             raise ValueError("vehicle_token and real_identity must not be empty")
         with self._lock:
-            self._identity_map[vehicle_token] = real_identity
+            self._token_vault[vehicle_token] = real_identity
         logger.info("Registered an identity mapping for a pseudonymous vehicle token")
 
     def create_request(
@@ -142,15 +143,15 @@ class UnmaskingService:
     def _expire_if_needed(self, record: UnmaskRequestRecord) -> None:
         if record.status == REQUESTED and record.is_expired():
             record.status = EXPIRED
-            # Phase 2: Automatic re-masking — remove identity from vault on expiry
-            # so the real identity cannot be disclosed after the request expires.
-            identity = self._identity_map.pop(record.vehicle_token, None)
-            if identity is not None:
-                logger.info(
-                    "Re-masked identity for token %s after request %s expired",
-                    record.vehicle_token,
-                    record.request_id,
-                )
+            # Phase 2: Mark request expired but do NOT delete the identity mapping.
+            # The underlying token→identity mapping is preserved; only the grant
+            # to disclose is revoked. Re-masking means the grant is expired, not
+            # that the identity is destroyed.
+            logger.info(
+                "Unmask request %s for token %s expired; grant revoked, identity mapping preserved",
+                record.request_id,
+                record.vehicle_token,
+            )
 
     def get_request(self, request_id: str) -> Optional[UnmaskRequestRecord]:
         with self._lock:
@@ -211,7 +212,7 @@ class UnmaskingService:
             ):
                 return None
 
-            identity = self._identity_map.get(record.vehicle_token)
+            identity = self._token_vault.get(record.vehicle_token)
             if identity is None:
                 return None
             record.identity_revealed_at = datetime.now(timezone.utc)
@@ -228,7 +229,7 @@ class UnmaskingService:
             if not requesting_user.has_permission("vault:write"):
                 return False
         with self._lock:
-            identity = self._identity_map.pop(vehicle_token, None)
+            identity = self._token_vault.pop(vehicle_token, None)
             if identity is not None:
                 logger.info("Re-masked identity for token %s on explicit request", vehicle_token)
                 return True
