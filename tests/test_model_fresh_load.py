@@ -27,7 +27,9 @@ def test_fresh_process_load_and_predict(tmp_path, monkeypatch):
     # Train and save a small model
     from detection.features import WindowFeatureExtractor
 
-    extractor = WindowFeatureExtractor()
+    # Real training records per-CAN-ID columns. Omit the explicit ID metadata
+    # here to cover recovery from feature names in existing artifacts.
+    extractor = WindowFeatureExtractor(reference_can_ids={"0316"})
     feature_names = extractor.feature_names()
 
     model = RandomForestClassifier(n_estimators=5, random_state=42)
@@ -61,7 +63,7 @@ def test_fresh_process_load_and_predict(tmp_path, monkeypatch):
 
     assert service.is_loaded()
     assert service.model is not None
-    assert service.model_metadata["model_algorithm"] == "RandomForestClassifier_fallback"
+    assert service.model_metadata["model_algorithm"] == "RandomForestClassifier"
     assert service.model_metadata["xgboost_available"] is False
 
     # Predict on a held-out window

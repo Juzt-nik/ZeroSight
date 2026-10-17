@@ -30,7 +30,7 @@ from detection.features import (
     FEATURE_VERSION as FEATURE_VERSION_STR,
 )
 
-# XGBoost availability — recorded in metadata so fallback is visible (Phase 1)
+# Record optional XGBoost availability, but the deployed baseline remains RF.
 try:
     import xgboost as xgb  # noqa: F401
     XGBOOST_AVAILABLE = True
@@ -40,10 +40,7 @@ except ImportError:
 logger = logging.getLogger("vsoc.model_service")
 
 if not XGBOOST_AVAILABLE:
-    logger.warning(
-        "XGBoost not available — falling back to RandomForestClassifier. "
-        "This fallback will be recorded in model metadata."
-    )
+    logger.info("XGBoost is unavailable; backend baseline uses RandomForestClassifier.")
 
 CLASS_LABELS = ["Normal", "DoS", "Fuzzy", "Gear", "RPM"]
 
@@ -94,6 +91,17 @@ class ModelService:
                 if metadata_path.exists():
                     with open(metadata_path) as f:
                         self.model_metadata = json.load(f)
+                    saved_feature_names = self.model_metadata.get("feature_names", [])
+                    reference_can_ids = self.model_metadata.get("reference_can_ids")
+                    if reference_can_ids is None:
+                        # Backward compatibility for artifacts created before
+                        # reference IDs were stored explicitly.
+                        reference_can_ids = [
+                            name[len("per_id_count_"):]
+                            for name in saved_feature_names
+                            if name.startswith("per_id_count_")
+                        ]
+                    self.feature_extractor.reference_can_ids = set(reference_can_ids)
                     # Verify artifact hash if recorded
                     saved_hash = self.model_metadata.get("artifact_hash")
                     if saved_hash and model_path.exists():
@@ -104,7 +112,6 @@ class ModelService:
                                 "Artifact may be corrupted or tampered."
                                 % (saved_hash, actual_hash)
                             )
-                    saved_feature_names = self.model_metadata.get("feature_names", [])
                     current_feature_names = self.feature_extractor.feature_names()
                     if saved_feature_names and saved_feature_names != current_feature_names:
                         raise RuntimeError(
@@ -220,8 +227,6 @@ class ModelService:
         joblib.dump(model, model_path)
         # Compute artifact hash for integrity verification
         model_hash = hashlib.sha256(model_path.read_bytes()).hexdigest()
-        self.model_metadata["artifact_hash"] = model_hash
-        self.model_metadata["artifact_hash_algorithm"] = "sha256"
         with open(metrics_path, "w") as f:
             json.dump(metrics, f, indent=2)
 
@@ -236,8 +241,11 @@ class ModelService:
             "trained_at": datetime.now(timezone.utc).isoformat(),
             "placeholder": False,
             "feature_names": feature_names,
+            "reference_can_ids": sorted(self.feature_extractor.reference_can_ids),
+            "artifact_hash": model_hash,
+            "artifact_hash_algorithm": "sha256",
             "xgboost_available": XGBOOST_AVAILABLE,
-            "model_algorithm": "XGBoost" if XGBOOST_AVAILABLE else "RandomForestClassifier_fallback",
+            "model_algorithm": "RandomForestClassifier",
         }
         with open(metadata_path, "w") as f:
             json.dump(self.model_metadata, f, indent=2)
