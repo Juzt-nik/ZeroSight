@@ -63,7 +63,7 @@ def test_fresh_process_load_and_predict(tmp_path, monkeypatch):
 
     assert service.is_loaded()
     assert service.model is not None
-    assert service.model_metadata["model_algorithm"] == "RandomForestClassifier"
+    assert service.model_metadata["model_algorithm"] == metadata["model_algorithm"]
     assert service.model_metadata["xgboost_available"] is False
 
     # Predict on a held-out window
