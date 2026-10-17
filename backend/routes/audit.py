@@ -20,7 +20,7 @@ async def get_audit_events(
     end_time: Optional[str] = None,
     limit: int = 50,
     offset: int = 0,
-    current_user: UserContext = Depends(lambda: get_current_user()),
+    current_user: UserContext = Depends(get_current_user),
 ):
     """Query audit events (auditor only)."""
     if not access_control.require_permission(current_user, "audit:read"):
@@ -42,7 +42,7 @@ async def get_audit_events(
 
 @router.get("/verify", response_model=VerifyResult)
 async def verify_audit_chain(
-    current_user: UserContext = Depends(lambda: get_current_user()),
+    current_user: UserContext = Depends(get_current_user),
 ):
     """Verify the integrity of the hash-chained audit log."""
     if not access_control.require_permission(current_user, "audit:verify"):
@@ -69,7 +69,7 @@ async def verify_audit_chain(
 
 @router.get("/checkpoints")
 async def get_audit_checkpoints(
-    current_user: UserContext = Depends(lambda: get_current_user()),
+    current_user: UserContext = Depends(get_current_user),
 ):
     """List all signed audit checkpoints (auditor only)."""
     if not access_control.require_permission(current_user, "audit:read"):
@@ -97,7 +97,7 @@ async def get_audit_checkpoints(
 
 @router.get("/checkpoints/verify")
 async def verify_audit_checkpoints(
-    current_user: UserContext = Depends(lambda: get_current_user()),
+    current_user: UserContext = Depends(get_current_user),
 ):
     """Verify all signed audit checkpoint signatures (auditor only)."""
     if not access_control.require_permission(current_user, "audit:verify"):
@@ -111,7 +111,7 @@ async def verify_audit_checkpoints(
 
 @router.post("/verify/tamper")
 async def test_tamper_detection(
-    current_user: UserContext = Depends(lambda: get_current_user()),
+    current_user: UserContext = Depends(get_current_user),
 ):
     """Test endpoint: demonstrates tamper detection by modifying a record and verifying."""
     if not access_control.require_permission(current_user, "audit:verify"):
