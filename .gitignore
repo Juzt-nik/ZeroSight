@@ -45,3 +45,5 @@ models/*.joblib
 
 # Streamlit
 .streamlit/secrets.toml
+# Local audit checkpoint private key
+data/audit_checkpoint_key.pem
