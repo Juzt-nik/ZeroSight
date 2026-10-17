@@ -25,7 +25,7 @@ import uuid
 
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Callable
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.serialization import (
@@ -64,6 +64,14 @@ class AuditService:
         self.db_path = db_path
         self._conn: Optional[sqlite3.Connection] = None
         self._checkpoint_key: Optional[Ed25519PrivateKey] = None
+        self._event_listener: Optional[Callable[[Dict[str, Any]], None]] = None
+
+    def set_event_listener(
+        self,
+        listener: Optional[Callable[[Dict[str, Any]], None]],
+    ) -> None:
+        """Register a consumer for newly persisted audit events."""
+        self._event_listener = listener
 
     async def initialize(self):
         """Initialize the database, checkpoint key, and genesis event."""
@@ -410,6 +418,28 @@ class AuditService:
             LIMIT 1
             """
         ).fetchone()[0]
+
+        # Notify consumers only after the audit record has been committed.
+        # A listener failure must not undo or hide the persisted audit event.
+        if self._event_listener is not None:
+            audit_event = {
+                "event_id": event_id,
+                "event_type": event_type,
+                "actor": actor,
+                "outcome": outcome,
+                "details": event_details,
+                "timestamp": timestamp,
+                "hash": hash_value,
+                "prev_hash": prev_hash,
+                "sequence": sequence,
+            }
+            try:
+                self._event_listener(audit_event)
+            except Exception:
+                logger.exception(
+                    "Audit event listener failed at sequence %s",
+                    sequence,
+                )
 
         if sequence % CHECKPOINT_INTERVAL == 0:
             self._create_checkpoint(

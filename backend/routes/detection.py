@@ -16,6 +16,9 @@ from backend.services.preprocessing import frame_to_dict
 
 router = APIRouter()
 
+# Bump this when the inference feature layout changes.
+FEATURE_SCHEMA_VERSION = "can-window-v1"
+
 
 @router.post("", response_model=DetectionResult)
 async def detect_single(
@@ -52,6 +55,8 @@ async def detect_single(
             outcome="success",
             details={
                 "prediction": prediction,
+                    "model_version": model_service.model_version,
+                    "feature_schema_version": FEATURE_SCHEMA_VERSION,
                 "confidence": confidence,
                 "arbitration_id": request.frame.arbitration_id,
                 "vehicle_token": request.vehicle_token,
@@ -105,6 +110,8 @@ async def detect_batch(
                 outcome="success",
                 details={
                     "prediction": prediction,
+                    "model_version": model_service.model_version,
+                    "feature_schema_version": FEATURE_SCHEMA_VERSION,
                     "confidence": confidence,
                     "arbitration_id": frame.arbitration_id,
                     "vehicle_token": request.vehicle_token,

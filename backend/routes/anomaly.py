@@ -24,6 +24,7 @@ async def get_anomaly_warnings(
     return {"warnings": warnings, "count": len(warnings)}
 
 
+
 @router.post("/record-event")
 async def record_access_event(
     user_id: str,
@@ -37,11 +38,36 @@ async def record_access_event(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Insufficient permissions",
         )
-    anomaly_detector.record(user_id=user_id, action=action, outcome=outcome)
+
+    # A caller cannot record events under another user's identity.
+    if user_id != current_user.user_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Cannot record access events for another user",
+        )
+
+    anomaly_detector.record(
+        user_id=user_id,
+        action=action,
+        outcome=outcome,
+    )
+
     await audit_service.log_event(
         event_type="access_denied" if outcome == "denial" else "attack_alert",
         actor=current_user.user_id,
         outcome="success",
-        details={"anomaly_record": {"user_id": user_id, "action": action, "outcome": outcome}},
+        details={
+            "anomaly_record": {
+                "user_id": user_id,
+                "action": action,
+                "outcome": outcome,
+            }
+        },
     )
-    return {"message": "Event recorded", "user_id": user_id, "action": action, "outcome": outcome}
+
+    return {
+        "message": "Event recorded",
+        "user_id": user_id,
+        "action": action,
+        "outcome": outcome,
+    }

@@ -12,6 +12,7 @@ from pathlib import Path
 from fastapi import FastAPI, Request, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from backend.services.anomaly_detector import anomaly_detector
 
 from backend.auth import validate_startup_config, get_current_user
 from backend.routes import detection, privacy, access, audit, anomaly
@@ -52,11 +53,34 @@ async def lifespan(app: FastAPI):
     # Validate security-critical configuration before initializing services
     validate_startup_config()
 
-    # Initialize audit service (hash-chained SQLite log) — mutate singleton, never reassign
+
+    # Initialize audit service while preserving the shared singleton.
     audit_db_path = os.getenv("AUDIT_DB_PATH", "./data/audit.db")
     audit_service.db_path = audit_db_path
+
+    # Connect audit events to anomaly monitoring.
+    anomaly_detector.clear()
+    audit_service.set_event_listener(
+        anomaly_detector.record_audit_event
+    )
+
     await audit_service.initialize()
     logger.info("Audit service initialized at %s", audit_db_path)
+
+    # Replay recent persisted events into anomaly monitoring.
+    recent_events = audit_service.get_events(
+        limit=10000,
+        offset=0,
+    )
+
+    for event in reversed(recent_events):
+        anomaly_detector.record_audit_event(event)
+
+    logger.info(
+        "Replayed %d recent audit records into anomaly monitoring",
+        len(recent_events),
+    )
+
 
     # Initialize access control — mutate singleton, never reassign
     access_control._users.clear()
@@ -122,7 +146,7 @@ app.add_middleware(
 @app.get("/health", tags=["system"])
 async def health():
     """Health check endpoint.
-    
+
     Reports unhealthy when required services (model, audit) are unavailable.
     """
     model_ok = model_service is not None and model_service.is_loaded()

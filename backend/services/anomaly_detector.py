@@ -1,142 +1,258 @@
-"""Access anomaly detection with explainable threshold rules.
+"""Rule-based anomaly detection for access and audit events.
 
-These are simple, auditable thresholds - NOT AI. They flag suspicious patterns
-such as repeated denials, excessive unmask attempts, off-hours access, etc.
+This detector intentionally uses small, explainable threshold rules rather than
+claiming to be an AI model. Persisted audit events can be passed to
+``record_audit_event`` so access anomalies are derived from server-recorded
+activity. Event history is kept in memory and should be replayed from the audit
+store during application startup.
 """
 
 import logging
+from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
 from typing import List, Dict, Any, Optional
-from dataclasses import dataclass
 
 logger = logging.getLogger("vsoc.anomaly")
 
-# Rule thresholds
+
+# ---------------------------------------------------------------------------
+# Rule configuration
+# ---------------------------------------------------------------------------
+
 MAX_DENIED_PER_WINDOW = 5
 DENIED_WINDOW_MINUTES = 10
 MAX_UNMASK_ATTEMPTS = 2
 UNMASK_WINDOW_MINUTES = 60
 BUSINESS_HOURS_START = 8
 BUSINESS_HOURS_END = 18
-MAX_ALERT_VIEWS = 100
-ALERT_VIEW_WINDOW_MINUTES = 10
+
+MAX_RECORDED_EVENTS = 10000
 
 
 @dataclass
 class AccessEvent:
+    """One normalized access/security event used by the detector."""
+
     user_id: str
     action: str
-    outcome: str  # success | denial
+    outcome: str
     timestamp: datetime
-    details: Dict[str, Any]
+    details: Dict[str, Any] = field(default_factory=dict)
 
 
 class AnomalyDetector:
-    """Stateful anomaly detector over recent access events."""
+    """Detect suspicious patterns using transparent threshold rules."""
 
-    def __init__(self):
+    def __init__(self) -> None:
         self._events: List[AccessEvent] = []
 
-    def record(self, user_id: str, action: str, outcome: str, details: Optional[Dict[str, Any]] = None):
-        """Record an access event for anomaly analysis."""
+    def clear(self) -> None:
+        """Clear in-memory events before replaying the persisted audit log."""
+        self._events.clear()
+
+    def record_audit_event(self, event: Dict[str, Any]) -> None:
+        """Normalize a persisted audit-service event for anomaly detection.
+
+        The actor comes from the server-created audit record rather than from a
+        user ID claimed in its details. Events created by the manual anomaly
+        simulation endpoint are skipped here because that endpoint records
+        them directly, which prevents double counting.
+        """
+        relevant_types = {
+            "access_denied",
+            "unmask_request",
+            "unmask_complete",
+            "access_approve",
+            "access_deny",
+            "attack_alert",
+            "audit_verify",
+        }
+
+        event_type = event.get("event_type")
+        if event_type not in relevant_types:
+            return
+
+        details = event.get("details")
+        if not isinstance(details, dict):
+            details = {}
+
+        # The simulation endpoint records its event directly. Avoid counting
+        # its corresponding audit record a second time through the listener.
+        if "anomaly_record" in details:
+            return
+
+        actor = event.get("actor")
+        if not isinstance(actor, str) or not actor.strip():
+            return
+        if actor in {"system", "unknown"}:
+            return
+
+        outcome = event.get("outcome")
+        if not isinstance(outcome, str) or not outcome.strip():
+            return
+
+        raw_timestamp = event.get("timestamp")
+        try:
+            if isinstance(raw_timestamp, datetime):
+                event_timestamp = raw_timestamp
+            elif isinstance(raw_timestamp, str):
+                event_timestamp = datetime.fromisoformat(
+                    raw_timestamp.replace("Z", "+00:00")
+                )
+            else:
+                raise ValueError("Missing audit timestamp")
+        except (TypeError, ValueError):
+            logger.warning(
+                "Skipping audit event with invalid timestamp: %s",
+                event.get("event_id"),
+            )
+            return
+
+        if event_timestamp.tzinfo is None:
+            event_timestamp = event_timestamp.replace(tzinfo=timezone.utc)
+        else:
+            event_timestamp = event_timestamp.astimezone(timezone.utc)
+
+        if event_type in {"access_denied", "access_deny"}:
+            outcome = "denial"
+
+        action = event_type
+        if event_type in {"access_denied", "attack_alert"}:
+            recorded_action = details.get("action")
+            if isinstance(recorded_action, str) and recorded_action.strip():
+                action = recorded_action
+
+        self.record(
+            user_id=actor,
+            action=action,
+            outcome=outcome,
+            details=details,
+            timestamp=event_timestamp,
+        )
+
+    def record(
+        self,
+        user_id: str,
+        action: str,
+        outcome: str,
+        details: Optional[Dict[str, Any]] = None,
+        timestamp: Optional[datetime] = None,
+    ) -> None:
+        """Record an event, optionally preserving its source timestamp.
+
+        Naive timestamps are interpreted as UTC so comparisons do not mix
+        timezone-aware and timezone-naive datetime instances.
+        """
+        event_time = timestamp or datetime.now(timezone.utc)
+        if event_time.tzinfo is None:
+            event_time = event_time.replace(tzinfo=timezone.utc)
+        else:
+            event_time = event_time.astimezone(timezone.utc)
+
         self._events.append(
             AccessEvent(
                 user_id=user_id,
                 action=action,
                 outcome=outcome,
-                timestamp=datetime.now(timezone.utc),
-                details=details or {},
+                timestamp=event_time,
+                details=details if isinstance(details, dict) else {},
             )
         )
-        # Keep only last 10000 events
-        if len(self._events) > 10000:
-            self._events = self._events[-10000:]
 
-    def _window_events(self, user_id: str, action: str, minutes: int) -> List[AccessEvent]:
-        cutoff = datetime.now(timezone.utc) - timedelta(minutes=minutes)
-        return [
-            e for e in self._events
-            if e.user_id == user_id and e.action == action and e.timestamp >= cutoff
-        ]
+        if len(self._events) > MAX_RECORDED_EVENTS:
+            self._events = self._events[-MAX_RECORDED_EVENTS:]
 
     def detect(self) -> List[Dict[str, Any]]:
-        """Run all anomaly rules and return warnings."""
-        warnings: List[Dict[str, Any]] = []
+        """Return active warnings from the events currently in memory."""
         now = datetime.now(timezone.utc)
+        warnings: List[Dict[str, Any]] = []
 
-        # Group events by user
-        users = set(e.user_id for e in self._events)
+        # ANOM-001: repeated denied requests in a short window.
+        denied_cutoff = now - timedelta(minutes=DENIED_WINDOW_MINUTES)
+        denied_by_user: Dict[str, List[AccessEvent]] = {}
+        for event in self._events:
+            if (
+                event.timestamp >= denied_cutoff
+                and event.timestamp <= now
+                and event.outcome.lower() in {"denial", "denied"}
+            ):
+                denied_by_user.setdefault(event.user_id, []).append(event)
 
-        for user_id in users:
-            user_events = [e for e in self._events if e.user_id == user_id]
+        for user_id, events in denied_by_user.items():
+            count = len(events)
+            if count >= MAX_DENIED_PER_WINDOW:
+                warnings.append(
+                    {
+                        "rule_id": "ANOM-001",
+                        "severity": "high",
+                        "user_id": user_id,
+                        "count": count,
+                        "window_minutes": DENIED_WINDOW_MINUTES,
+                        "message": (
+                            f"User {user_id} had {count} denied access attempts "
+                            f"within {DENIED_WINDOW_MINUTES} minutes"
+                        ),
+                    }
+                )
 
-            # Rule 1: Repeated denied requests
-            denied = [e for e in user_events if e.outcome == "denial"]
-            recent_denied = [
-                e for e in denied
-                if e.timestamp >= now - timedelta(minutes=DENIED_WINDOW_MINUTES)
-            ]
-            if len(recent_denied) >= MAX_DENIED_PER_WINDOW:
-                warnings.append({
-                    "rule_id": "ANOM-001",
-                    "rule_name": "Repeated denied requests",
-                    "severity": "high",
-                    "user_id": user_id,
-                    "description": (
-                        f"{len(recent_denied)} denied requests in "
-                        f"{DENIED_WINDOW_MINUTES} minutes (threshold: {MAX_DENIED_PER_WINDOW})"
-                    ),
-                    "count": len(recent_denied),
-                    "window_minutes": DENIED_WINDOW_MINUTES,
-                    "first_occurrence": min(e.timestamp for e in recent_denied).isoformat(),
-                    "last_occurrence": max(e.timestamp for e in recent_denied).isoformat(),
-                })
+        # ANOM-002: repeated unmask requests in a one-hour window.
+        unmask_cutoff = now - timedelta(minutes=UNMASK_WINDOW_MINUTES)
+        unmask_by_user: Dict[str, List[AccessEvent]] = {}
+        for event in self._events:
+            if (
+                event.timestamp >= unmask_cutoff
+                and event.timestamp <= now
+                and event.action == "unmask_request"
+            ):
+                unmask_by_user.setdefault(event.user_id, []).append(event)
 
-            # Rule 2: Excessive unmask attempts
-            unmask_attempts = [
-                e for e in user_events
-                if e.action == "unmask_request"
-                and e.timestamp >= now - timedelta(minutes=UNMASK_WINDOW_MINUTES)
-            ]
-            if len(unmask_attempts) >= MAX_UNMASK_ATTEMPTS:
-                warnings.append({
-                    "rule_id": "ANOM-002",
-                    "rule_name": "Excessive unmask attempts",
-                    "severity": "critical",
-                    "user_id": user_id,
-                    "description": (
-                        f"{len(unmask_attempts)} unmask requests in "
-                        f"{UNMASK_WINDOW_MINUTES} minutes (threshold: {MAX_UNMASK_ATTEMPTS})"
-                    ),
-                    "count": len(unmask_attempts),
-                    "window_minutes": UNMASK_WINDOW_MINUTES,
-                    "first_occurrence": min(e.timestamp for e in unmask_attempts).isoformat(),
-                    "last_occurrence": max(e.timestamp for e in unmask_attempts).isoformat(),
-                })
+        for user_id, events in unmask_by_user.items():
+            count = len(events)
+            if count >= MAX_UNMASK_ATTEMPTS:
+                warnings.append(
+                    {
+                        "rule_id": "ANOM-002",
+                        "severity": "medium",
+                        "user_id": user_id,
+                        "count": count,
+                        "window_minutes": UNMASK_WINDOW_MINUTES,
+                        "message": (
+                            f"User {user_id} made {count} unmask requests "
+                            f"within {UNMASK_WINDOW_MINUTES} minutes"
+                        ),
+                    }
+                )
 
-            # Rule 3: Off-hours access
-            off_hours = [
-                e for e in user_events
-                if not (BUSINESS_HOURS_START <= e.timestamp.hour < BUSINESS_HOURS_END)
-            ]
-            if len(off_hours) >= 3:
-                warnings.append({
-                    "rule_id": "ANOM-003",
-                    "rule_name": "Off-hours access",
-                    "severity": "medium",
-                    "user_id": user_id,
-                    "description": (
-                        f"{len(off_hours)} access events outside "
-                        f"{BUSINESS_HOURS_START}:00-{BUSINESS_HOURS_END}:00"
-                    ),
-                    "count": len(off_hours),
-                    "window_minutes": 0,
-                    "first_occurrence": min(e.timestamp for e in off_hours).isoformat(),
-                    "last_occurrence": max(e.timestamp for e in off_hours).isoformat(),
-                })
+        # ANOM-003: repeated activity outside configured business hours.
+        # Source timestamps are normalized to UTC; these hours therefore refer
+        # to UTC until a deployment-specific timezone policy is configured.
+        off_hours_by_user: Dict[str, List[AccessEvent]] = {}
+        for event in self._events:
+            hour = event.timestamp.hour
+            outside_business_hours = not (
+                BUSINESS_HOURS_START <= hour < BUSINESS_HOURS_END
+            )
+            if outside_business_hours:
+                off_hours_by_user.setdefault(event.user_id, []).append(event)
+
+        for user_id, events in off_hours_by_user.items():
+            count = len(events)
+            if count >= 3:
+                warnings.append(
+                    {
+                        "rule_id": "ANOM-003",
+                        "severity": "low",
+                        "user_id": user_id,
+                        "count": count,
+                        "message": (
+                            f"User {user_id} had {count} events outside "
+                            "configured business hours"
+                        ),
+                    }
+                )
 
         return warnings
 
 
-# Module-level singleton instance
+# Module-level detector shared by application routes and the audit listener.
 anomaly_detector = AnomalyDetector()
