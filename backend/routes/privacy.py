@@ -6,6 +6,7 @@ from typing import Optional
 
 from fastapi import APIRouter, Depends, Header, HTTPException, status
 
+from backend.auth import get_current_user
 from backend.schemas.privacy import (
     TokenizeRequest,
     TokenizeResponse,
@@ -23,99 +24,6 @@ from backend.services.access_control import access_control, UserContext
 
 router = APIRouter()
 unmask_service = UnmaskingService()
-
-# Synthetic demo principals only. Tokens are supplied through environment
-# variables and must be unique, random, and at least 32 characters long.
-_DEMO_TOKEN_USERS = (
-    ("ZEROSIGHT_ANALYST_TOKEN", "analyst_1"),
-    ("ZEROSIGHT_SECURITY_OFFICER_1_TOKEN", "sec_officer_1"),
-    ("ZEROSIGHT_SECURITY_OFFICER_2_TOKEN", "sec_officer_2"),
-    ("ZEROSIGHT_SECURITY_OFFICER_3_TOKEN", "sec_officer_3"),
-    ("ZEROSIGHT_AUDITOR_TOKEN", "auditor_1"),
-    ("ZEROSIGHT_ADMIN_TOKEN", "admin_1"),
-)
-
-
-def get_current_user(
-    authorization: Optional[str] = Header(default=None, alias="Authorization"),
-) -> UserContext:
-    """Authenticate a local demo Bearer token; production must use an IdP.
-
-    Authentication intentionally fails closed if demo auth is disabled or token
-    configuration is missing/weak. Client-supplied user IDs are never trusted.
-    """
-    demo_enabled = os.getenv("ZEROSIGHT_DEMO_AUTH", "false").strip().lower()
-    if demo_enabled not in {"1", "true", "yes"}:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=(
-                "No authentication provider is configured. Enable demo authentication "
-                "only for local development, or integrate a trusted identity provider."
-            ),
-        )
-
-    if not authorization:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Missing Bearer token",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-    scheme, separator, token = authorization.partition(" ")
-    if not separator or scheme.lower() != "bearer" or not token.strip():
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid authorization header",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-    token = token.strip()
-
-    configured_tokens = []
-    weak_configuration = False
-    for environment_name, user_id in _DEMO_TOKEN_USERS:
-        expected = os.getenv(environment_name)
-        if not expected:
-            continue
-        if len(expected) < 32:
-            weak_configuration = True
-        else:
-            configured_tokens.append((expected, user_id))
-
-    if weak_configuration:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Demo Bearer tokens must be at least 32 characters long",
-        )
-    if not configured_tokens:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="No demo Bearer tokens are configured",
-        )
-
-    matches = [
-        user_id
-        for expected, user_id in configured_tokens
-        if hmac.compare_digest(token, expected)
-    ]
-    if len(matches) > 1:
-        # Duplicate tokens across principals are an authentication misconfiguration.
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Duplicate demo tokens are configured; authentication is disabled",
-        )
-    if not matches:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid Bearer token",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-
-    user = access_control.get_user(matches[0])
-    if user is None:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Authenticated demo principal is not registered",
-        )
-    return user
 
 
 @router.post("/tokenize", response_model=TokenizeResponse)

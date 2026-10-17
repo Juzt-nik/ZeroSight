@@ -10,6 +10,7 @@ import os
 import json
 import logging
 import asyncio
+import hashlib
 from pathlib import Path
 from datetime import datetime, timezone
 from typing import Optional, Tuple, Dict, Any, List
@@ -29,7 +30,20 @@ from detection.features import (
     FEATURE_VERSION as FEATURE_VERSION_STR,
 )
 
+# XGBoost availability — recorded in metadata so fallback is visible (Phase 1)
+try:
+    import xgboost as xgb  # noqa: F401
+    XGBOOST_AVAILABLE = True
+except ImportError:
+    XGBOOST_AVAILABLE = False
+
 logger = logging.getLogger("vsoc.model_service")
+
+if not XGBOOST_AVAILABLE:
+    logger.warning(
+        "XGBoost not available — falling back to RandomForestClassifier. "
+        "This fallback will be recorded in model metadata."
+    )
 
 CLASS_LABELS = ["Normal", "DoS", "Fuzzy", "Gear", "RPM"]
 
@@ -75,8 +89,35 @@ class ModelService:
 
         if model_path.exists():
             try:
-                self.model = joblib.load(model_path)
-                self.is_trained = True
+                model = joblib.load(model_path)
+                # P0-05: Validate feature-schema parity between saved artifact and extractor
+                if metadata_path.exists():
+                    with open(metadata_path) as f:
+                        self.model_metadata = json.load(f)
+                    # Verify artifact hash if recorded
+                    saved_hash = self.model_metadata.get("artifact_hash")
+                    if saved_hash and model_path.exists():
+                        actual_hash = hashlib.sha256(model_path.read_bytes()).hexdigest()
+                        if actual_hash != saved_hash:
+                            raise RuntimeError(
+                                "Model artifact hash mismatch: expected %s, got %s. "
+                                "Artifact may be corrupted or tampered."
+                                % (saved_hash, actual_hash)
+                            )
+                    saved_feature_names = self.model_metadata.get("feature_names", [])
+                    current_feature_names = self.feature_extractor.feature_names()
+                    if saved_feature_names and saved_feature_names != current_feature_names:
+                        raise RuntimeError(
+                            "Feature-schema mismatch: saved artifact expects %d features "
+                            "(%s) but extractor produces %d features (%s). "
+                            "Retrain with the same feature configuration."
+                            % (
+                                len(saved_feature_names),
+                                saved_feature_names[:5],
+                                len(current_feature_names),
+                                current_feature_names[:5],
+                            )
+                        )
                 if self.use_ensemble and if_path.exists():
                     try:
                         self.isolation_forest = joblib.load(if_path)
@@ -86,15 +127,24 @@ class ModelService:
                 if metrics_path.exists():
                     with open(metrics_path) as f:
                         self.metrics = json.load(f)
-                if metadata_path.exists():
-                    with open(metadata_path) as f:
-                        self.model_metadata = json.load(f)
+                # All validation passed — assign the model and mark as trained
+                self.model = model
+                self.is_trained = True
                 logger.info("Loaded existing model from %s", model_path)
                 return
+            except RuntimeError:
+                # Re-raise schema/hash mismatch errors — don't swallow them
+                raise
             except Exception as exc:
-                logger.warning("Failed to load model: %s; will retrain", exc)
+                logger.warning("Failed to load model: %s", exc)
 
-        await self._train_baseline()
+        # No valid trained model available — fail safely, no dummy fallback
+        raise RuntimeError(
+            "No trained model found at %s. Train and save a model artifact first "
+            "(see ZeroSight_ML_Pipeline.ipynb). The backend will not serve predictions "
+            "without a valid trained model."
+            % model_path
+        )
     async def _train_baseline(self):
         """Train a RandomForest baseline from Car Hacking CSVs."""
         model_path = self.model_dir / "baseline_rf.pkl"
@@ -127,37 +177,11 @@ class ModelService:
             logger.info("Loaded %s: %d rows, label=%s", fname, len(df), label)
 
         if not frames:
-            logger.warning("No dataset files found; creating untrained placeholder model")
-            self.model = RandomForestClassifier(n_estimators=10, random_state=42)
-            feature_names = self.feature_extractor.feature_names()
-            X_dummy = np.zeros((1, len(feature_names)))
-            y_dummy = np.array(["Normal"])
-            self.model.fit(X_dummy, y_dummy)
-            self.is_trained = True
-            self.metrics = {
-                "accuracy": 0.0,
-                "precision_macro": 0.0,
-                "recall_macro": 0.0,
-                "f1_macro": 0.0,
-                "per_class": {},
-                "confusion_matrix": [[0]],
-                "classes": CLASS_LABELS,
-                "training_samples": 0,
-                "test_samples": 0,
-                "note": "No dataset found - placeholder model",
-            }
-            self.model_metadata = {
-                "dataset_version": "none",
-                "feature_version": FEATURE_VERSION_STR,
-                "split_strategy": "none",
-                "model_version": self.model_version,
-                "training_samples": 0,
-                "test_samples": 0,
-                "window_ms": self.window_ms,
-                "trained_at": datetime.now(timezone.utc).isoformat(),
-                "placeholder": True,
-            }
-            return
+            raise RuntimeError(
+                "No dataset files found in %s. Cannot train a model without "
+                "HCRL Car-Hacking dataset. Expected: %s"
+                % (self.dataset_dir, ", ".join(csv_files))
+            )
 
         data = pd.concat(frames, ignore_index=True)
         logger.info("Total dataset: %d rows", len(data))
@@ -194,6 +218,10 @@ class ModelService:
 
         # Save model, metrics, and metadata
         joblib.dump(model, model_path)
+        # Compute artifact hash for integrity verification
+        model_hash = hashlib.sha256(model_path.read_bytes()).hexdigest()
+        self.model_metadata["artifact_hash"] = model_hash
+        self.model_metadata["artifact_hash_algorithm"] = "sha256"
         with open(metrics_path, "w") as f:
             json.dump(metrics, f, indent=2)
 
@@ -208,6 +236,8 @@ class ModelService:
             "trained_at": datetime.now(timezone.utc).isoformat(),
             "placeholder": False,
             "feature_names": feature_names,
+            "xgboost_available": XGBOOST_AVAILABLE,
+            "model_algorithm": "XGBoost" if XGBOOST_AVAILABLE else "RandomForestClassifier_fallback",
         }
         with open(metadata_path, "w") as f:
             json.dump(self.model_metadata, f, indent=2)
