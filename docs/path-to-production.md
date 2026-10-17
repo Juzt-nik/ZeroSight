@@ -21,11 +21,27 @@ Appendix A/D requirements.
 | Orchestration | Docker Compose | OpenShift on IBM Z | stand-in | No K8s manifests; single-node only | Platform | `compose.yaml` |
 | ML model | RandomForest (scikit-learn) | XGBoost + Isolation Forest | stand-in | Ensemble behind `USE_ENSEMBLE` flag; not default | ML | `backend/services/model_service.py` |
 | CAN bus interface | File-based dataset replay | Real CAN bus hardware interface | missing | No live vehicle integration | ML | `scripts/replay.py` |
-| Authentication | JWT / demo bearer tokens | OIDC / Keycloak integration | implemented | Production JWT path requires PyJWT + AUTH_SECRET | Security | `backend/auth.py` |
+| Authentication | JWT / demo bearer tokens | OIDC / Keycloak integration | implemented | Production JWT path requires strong AUTH_SECRET and managed identity | Security | `backend/auth.py` |
 | Access control | In-memory RBAC | OPA / external policy engine | stand-in | No dynamic policy updates | Security | `backend/services/access_control.py` |
 | Audit log | Hash-chained SQLite | External WORM anchoring | implemented | Checkpoints exist but not externally anchored | Security | `backend/services/audit_service.py` |
 | Unmasking | Dual-approval in-memory | HSM-backed dual approval | implemented | Identity map in memory; not persisted across restarts | Security | `backend/services/unmasking.py` |
 | Dashboard | Streamlit | Enterprise SIEM dashboard | stand-in | No SSO; no role-based view restrictions | Frontend | `frontend/streamlit_app.py` |
+
+## Deployment Key Handling
+
+The Ed25519 audit checkpoint key is a persistent environment secret. Docker
+builds exclude `data/audit_checkpoint_key.pem`; Compose mounts the host file at
+`/run/secrets/audit_checkpoint_key.pem`. Provision a new key for each
+deployment environment and protect its host copy with restrictive permissions.
+On LinuxONE, provision the key before starting Compose:
+
+```sh
+umask 077
+openssl genpkey -algorithm Ed25519 -out data/audit_checkpoint_key.pem
+```
+Do not copy the developer machine's key to LinuxONE or rotate/delete a key while
+retaining checkpoints signed by it. PyJWT is pinned in `requirements.txt` and
+is required for the non-demo JWT path.
 
 ---
 

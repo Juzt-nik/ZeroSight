@@ -7,6 +7,29 @@ import numpy as np
 import re
 from typing import Dict, Any, List
 
+HCRL_LABELS = {"R", "T", "A", "G", "F", "D", "Normal", "DoS", "Fuzzy", "Gear", "RPM"}
+ATTACK_CLASSES = {"DoS", "Fuzzy", "Gear", "RPM"}
+
+
+def normalize_hcrl_label(raw_label: str | None, capture_label: str) -> str:
+    """Normalize HCRL labels while preserving row-level normal/attack markers.
+
+    HCRL's R marker means a normal row. T means an attack row and is mapped to
+    the named attack type of that capture. Explicit class labels are preserved.
+    The unlabeled normal text capture is the only source allowed to omit a label.
+    """
+    if raw_label == "R":
+        return "Normal"
+    if raw_label == "T":
+        if capture_label not in ATTACK_CLASSES:
+            raise ValueError("HCRL attack marker T requires an attack capture class")
+        return capture_label
+    if raw_label in {"Normal", "DoS", "Fuzzy", "Gear", "RPM"}:
+        return raw_label
+    if raw_label is None and capture_label == "Normal":
+        return "Normal"
+    raise ValueError(f"Missing or unsupported HCRL row label: {raw_label!r}")
+
 
 def parse_can_line(line: str) -> Dict[str, Any]:
     """Parse a single line from Car Hacking CSV format.
@@ -53,7 +76,7 @@ def parse_can_line(line: str) -> Dict[str, Any]:
         byte_parts = parts[3:]
     elif len(parts) == 4 + dlc:
         label = parts[-1]
-        if label not in ("R", "T", "A", "G", "F", "D", "Normal", "DoS", "Fuzzy", "Gear", "RPM"):
+        if label not in HCRL_LABELS:
             raise ValueError(f"Unknown label: {label}")
         byte_parts = parts[3:-1]
     else:

@@ -4,7 +4,7 @@
 
 The model pipeline uses the HCRL Car Hacking Dataset:
 
-| File | Assigned class |
+| File | Class assigned to HCRL `T` rows |
 |---|---|
 | `DoS_dataset.csv` | DoS |
 | `Fuzzy_dataset.csv` | Fuzzy |
@@ -18,6 +18,14 @@ label counts, malformed rows, and CAN ID/payload parsing. CSV and normal text
 capture formats are both supported; every payload must contain exactly DLC
 hexadecimal bytes.
 
+The validator explicitly maps HCRL `R` rows to `Normal` and `T` rows to the
+attack class named by that attack capture. Explicit class labels are preserved;
+missing or unsupported labels in attack captures fail validation. The default
+quality gate rejects any individual capture with more than 0.1% malformed
+nonempty rows. Set `DATASET_MAX_INVALID_ROW_RATE` or pass
+`--max-invalid-rate` to use a different approved threshold. Training runs the
+same validator first and refuses a dataset that fails the gate.
+
 ## Features and split
 
 Training and serving use the same versioned `WindowFeatureExtractor` from
@@ -27,8 +35,10 @@ rate, DLC statistics, timestamp span, unseen-ID count, and per-ID count and
 inter-arrival/frequency features.
 
 Training forms 100 ms buckets relative to each capture's first timestamp, so
-frames from different captures can never share a window. Captures are kept
-separate for the contiguous 80/20 train/test window split. This is
+frames from different captures can never share a window. Each capture is split
+chronologically into its own 80/20 train/test windows. The reference CAN-ID
+vocabulary is derived from training frames only, so test-only IDs are treated
+as unseen. This is
 time-ordered evaluation; broader temporal leakage and cross-vehicle
 generalization have not been established.
 

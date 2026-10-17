@@ -19,7 +19,6 @@ import joblib
 import numpy as np
 import pandas as pd
 from sklearn.ensemble import RandomForestClassifier, IsolationForest
-from sklearn.model_selection import train_test_split
 from sklearn.metrics import (
     accuracy_score, precision_score, recall_score, f1_score,
     confusion_matrix, classification_report
@@ -29,7 +28,8 @@ from detection.features import (
     WindowFeatureExtractor,
     FEATURE_VERSION as FEATURE_VERSION_STR,
 )
-from backend.services.preprocessing import parse_can_line
+from backend.services.preprocessing import parse_can_line, normalize_hcrl_label
+from scripts.validate_dataset import validate_dataset
 
 # Record optional XGBoost availability, but the deployed baseline remains RF.
 try:
@@ -172,6 +172,18 @@ class ModelService:
         metrics_path = self.model_dir / "metrics.json"
         metadata_path = self.model_dir / "metadata.json"
 
+        validation = validate_dataset(self.dataset_dir)
+        if validation["total_invalid"]:
+            logger.warning(
+                "Dataset passed the %.4f malformed-row limit with %d malformed rows; these rows will be excluded",
+                validation["max_invalid_row_rate"], validation["total_invalid"],
+            )
+        if not validation["valid"]:
+            raise RuntimeError(
+                "Dataset validation failed; refusing to train: "
+                + json.dumps(validation.get("quality_failures", validation.get("missing_files", [])))
+            )
+
         csv_files = [
             "DoS_dataset.csv", "Fuzzy_dataset.csv", "gear_dataset.csv",
             "RPM_dataset.csv", "normal_run_data.txt"
@@ -208,13 +220,21 @@ class ModelService:
         data = pd.concat(frames, ignore_index=True)
         logger.info("Total dataset: %d rows", len(data))
 
-        # Engineer window-level features using shared extractor (P0-05)
-        X, y, feature_names = self._engineer_features(data)
-
-        # P1-04: Time-based split - contiguous segments, first 80% train, last 20% test
-        split_idx = int(len(X) * 0.8)
-        X_train, X_test = X[:split_idx], X[split_idx:]
-        y_train, y_test = y[:split_idx], y[split_idx:]
+        # Split each capture in chronological order before deriving the CAN ID
+        # vocabulary, preventing both capture and feature-vocabulary leakage.
+        windows = self._build_window_records(data)
+        train_windows, test_windows = self._split_capture_aware(windows)
+        training_ids = {
+            frame["arbitration_id"]
+            for window in train_windows
+            for frame in window["frames"]
+        }
+        self.feature_extractor = WindowFeatureExtractor(
+            window_ms=self.window_ms, reference_can_ids=training_ids
+        )
+        feature_names = self.feature_extractor.feature_names()
+        X_train, y_train = self._features_from_windows(train_windows, feature_names)
+        X_test, y_test = self._features_from_windows(test_windows, feature_names)
         if len(X_train) == 0 or len(X_test) == 0:
             raise RuntimeError("Need at least two windows to create non-empty train and test splits")
 
@@ -253,7 +273,7 @@ class ModelService:
         self.model_metadata = {
             "dataset_version": "hcrl_car_hacking_v1",
             "feature_version": FEATURE_VERSION_STR,
-            "split_strategy": "time_based_80_20",
+            "split_strategy": "capture_aware_chronological_80_20",
             "model_version": self.model_version,
             "training_samples": int(len(X_train)),
             "test_samples": int(len(X_test)),
@@ -305,16 +325,75 @@ class ModelService:
                     continue
                 try:
                     parsed = parse_can_line(line)
+                    normalized_label = normalize_hcrl_label(parsed["label"], label)
                     rows.append({
                         "timestamp": parsed["timestamp"],
                         "arbitration_id": parsed["arbitration_id"],
                         "dlc": parsed["dlc"],
                         "data_bytes": parsed["data_bytes"],
-                        "label": parsed["label"] if parsed["label"] in CLASS_LABELS else label,
+                        "label": normalized_label,
                     })
                 except (ValueError, IndexError):
                     continue
         return pd.DataFrame(rows)
+
+    def _build_window_records(self, df: pd.DataFrame) -> List[Dict[str, Any]]:
+        """Build chronological windows while retaining hard capture boundaries."""
+        if df.empty:
+            return []
+        if "capture_id" not in df.columns:
+            df = df.copy()
+            df["capture_id"] = "capture"
+        df = df.sort_values(["capture_id", "timestamp"], kind="stable")
+        windows = []
+        for capture_id, capture in df.groupby("capture_id", sort=True):
+            times_ms = capture["timestamp"].to_numpy(dtype=float) * 1000.0
+            origin = float(times_ms[0])
+            buckets = np.floor((times_ms - origin) / self.window_ms).astype(np.int64)
+            for bucket in np.unique(buckets):
+                window_df = capture.iloc[np.flatnonzero(buckets == bucket)]
+                labels = window_df["label"].tolist()
+                windows.append({
+                    "capture_id": capture_id,
+                    "bucket": int(bucket),
+                    "window_start_ms": origin + int(bucket) * self.window_ms,
+                    "frames": window_df.to_dict("records"),
+                    "label": max(set(labels), key=labels.count),
+                })
+        return windows
+
+    @staticmethod
+    def _split_capture_aware(
+        windows: List[Dict[str, Any]], train_fraction: float = 0.8
+    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        """Chronologically split every capture, requiring train and test rows."""
+        train_windows, test_windows = [], []
+        captures = {}
+        for window in windows:
+            captures.setdefault(window["capture_id"], []).append(window)
+        for capture_id in sorted(captures):
+            capture_windows = captures[capture_id]
+            capture_windows.sort(key=lambda window: window["window_start_ms"])
+            if len(capture_windows) < 2:
+                raise RuntimeError(
+                    f"Capture {capture_id!r} has fewer than two windows; cannot create a leakage-safe split"
+                )
+            split_at = max(1, min(len(capture_windows) - 1, int(len(capture_windows) * train_fraction)))
+            train_windows.extend(capture_windows[:split_at])
+            test_windows.extend(capture_windows[split_at:])
+        return train_windows, test_windows
+
+    def _features_from_windows(
+        self, windows: List[Dict[str, Any]], feature_names: List[str]
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        matrix, labels = [], []
+        for window in windows:
+            features = self.feature_extractor.extract_window(
+                window["frames"], window["window_start_ms"]
+            )
+            matrix.append([float(features.get(name, 0.0)) for name in feature_names])
+            labels.append(window["label"])
+        return np.asarray(matrix, dtype=np.float32), np.asarray(labels)
 
     def _engineer_features(self, df: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray, List[str]]:
         """Engineer window-level features from a DataFrame of CAN frames.
@@ -326,46 +405,14 @@ class ModelService:
         if self.feature_extractor is None:
             self.feature_extractor = WindowFeatureExtractor(window_ms=self.window_ms)
 
-        if "capture_id" not in df.columns:
-            df = df.copy()
-            df["capture_id"] = "capture"
-        df = df.sort_values(["capture_id", "timestamp"], kind="stable").reset_index(drop=True)
-
-        # Collect reference CAN IDs from the data
-        ref_ids = set(df["arbitration_id"].unique().tolist())
+        windows = self._build_window_records(df)
+        ref_ids = {frame["arbitration_id"] for window in windows for frame in window["frames"]}
         self.feature_extractor.reference_can_ids = ref_ids
-
-        # Determine window boundaries from data
-        if len(df) == 0:
+        if not windows:
             empty = np.zeros((1, len(self.feature_extractor.feature_names())))
             return empty, np.array(["Normal"]), self.feature_extractor.feature_names()
-
-        window_features: List[Dict[str, Any]] = []
-        window_labels: List[str] = []
-        for _, capture in df.groupby("capture_id", sort=False):
-            capture = capture.sort_values("timestamp", kind="stable").copy()
-            times_ms = capture["timestamp"].to_numpy(dtype=float) * 1000.0
-            origin = float(times_ms[0])
-            buckets = np.floor((times_ms - origin) / self.window_ms).astype(np.int64)
-            for bucket in np.unique(buckets):
-                window_df = capture.iloc[np.flatnonzero(buckets == bucket)]
-                feats = self.feature_extractor.extract_window(
-                    window_df.to_dict("records"), origin + bucket * self.window_ms
-                )
-                labels = window_df["label"].tolist()
-                window_features.append(feats)
-                window_labels.append(max(set(labels), key=labels.count))
-
-        if not window_features:
-            empty = np.zeros((1, len(self.feature_extractor.feature_names())))
-            return empty, np.array(["Normal"]), self.feature_extractor.feature_names()
-
         feature_names = self.feature_extractor.feature_names()
-        X = np.array([
-            [float(f.get(name, 0.0)) for name in feature_names]
-            for f in window_features
-        ], dtype=np.float32)
-        y = np.array(window_labels)
+        X, y = self._features_from_windows(windows, feature_names)
         return X, y, feature_names
 
     def _compute_metrics(self, y_true, y_pred, classes) -> Dict[str, Any]:

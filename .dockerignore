@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+*.so
+*.db
+*.sqlite
+*.sqlite3
+venv/
+.venv/
+.env
+.git/
+.gitignore
+README.md
+data/raw/*.csv
+data/raw/*.txt
+data/audit_checkpoint_key.pem
+models/*.pkl
+models/*.json

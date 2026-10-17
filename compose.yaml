@@ -9,6 +9,8 @@ services:
       - ./data/raw:/app/data/raw:ro
       - ./models:/app/models
       - ./data/audit.db:/app/data/audit.db
+      # Provision this persistent private key on the host; it is excluded from the image.
+      - ./data/audit_checkpoint_key.pem:/run/secrets/audit_checkpoint_key.pem:ro
     environment:
       - APP_ENV=development
       - APP_HOST=0.0.0.0
@@ -25,6 +27,7 @@ services:
       - REQUIRED_APPROVERS=2
       - AUDIT_DB_PATH=/app/data/audit.db
       - AUDIT_HASH_CHAIN_ENABLED=true
+      - AUDIT_CHECKPOINT_KEY_PATH=/run/secrets/audit_checkpoint_key.pem
       - DATASET_DIR=/app/data/raw
       - MODEL_DIR=/app/models
     restart: unless-stopped

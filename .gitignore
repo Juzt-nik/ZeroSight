@@ -42,7 +42,6 @@ models/*.joblib
 *.db-wal
 
 # Docker
-.dockerignore
 
 # Streamlit
 .streamlit/secrets.toml

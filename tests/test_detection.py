@@ -12,6 +12,7 @@ from sklearn.ensemble import RandomForestClassifier
 
 from backend.services.model_service import ModelService
 from backend.services.preprocessing import parse_can_line
+from backend.services.preprocessing import normalize_hcrl_label
 
 
 def test_parse_can_line():
@@ -40,6 +41,22 @@ def test_parse_normal_capture_format_and_reject_bad_payload():
         parse_can_line("1.0,0316,2,05,R")
 
 
+@pytest.mark.parametrize(
+    ("raw_label", "capture_label", "expected"),
+    [("R", "DoS", "Normal"), ("T", "DoS", "DoS"), ("T", "RPM", "RPM"),
+     ("Fuzzy", "DoS", "Fuzzy"), (None, "Normal", "Normal")],
+)
+def test_hcrl_row_labels_are_explicitly_normalized(raw_label, capture_label, expected):
+    assert normalize_hcrl_label(raw_label, capture_label) == expected
+
+
+def test_hcrl_unknown_or_ambiguous_row_label_is_rejected():
+    with pytest.raises(ValueError, match="unsupported"):
+        normalize_hcrl_label("A", "DoS")
+    with pytest.raises(ValueError, match="requires an attack capture"):
+        normalize_hcrl_label("T", "Normal")
+
+
 def test_windows_never_combine_separate_captures():
     service = ModelService()
     service.feature_extractor = __import__(
@@ -54,6 +71,33 @@ def test_windows_never_combine_separate_captures():
     X, y, _ = service._engineer_features(df)
     assert X.shape[0] == 2
     assert set(y) == {"Normal", "DoS"}
+
+
+def test_capture_aware_split_has_no_chronological_or_vocabulary_leakage():
+    service = ModelService()
+    service.window_ms = 100.0
+    service.feature_extractor = __import__(
+        "detection.features", fromlist=["WindowFeatureExtractor"]
+    ).WindowFeatureExtractor(window_ms=100.0)
+    import pandas as pd
+
+    rows = []
+    for index in range(10):
+        rows.append({
+            "capture_id": "capture-a", "timestamp": 1.0 + index * 0.11,
+            "arbitration_id": "0316" if index < 8 else "07ff", "dlc": 1,
+            "data_bytes": [index], "label": "Normal",
+        })
+    windows = service._build_window_records(pd.DataFrame(rows))
+    training, testing = service._split_capture_aware(windows)
+    assert max(w["window_start_ms"] for w in training) < min(w["window_start_ms"] for w in testing)
+    training_ids = {f["arbitration_id"] for w in training for f in w["frames"]}
+    assert "07ff" not in training_ids
+    service.feature_extractor.reference_can_ids = training_ids
+    feature_names = service.feature_extractor.feature_names()
+    X_test, _ = service._features_from_windows(testing, feature_names)
+    unseen_index = feature_names.index("unseen_id_count")
+    assert X_test[0, unseen_index] == 1
 
 
 def test_model_initializes(tmp_path, monkeypatch):
