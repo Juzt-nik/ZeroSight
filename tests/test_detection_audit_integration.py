@@ -1,4 +1,4 @@
-﻿import json
+import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -64,3 +64,5 @@ async def test_detect_attack_persists_audit_alert(monkeypatch, tmp_path):
     assert details["prediction"] == "DoS"
     assert details["arbitration_id"] == "0316"
     assert details["vehicle_token"] == "test-vehicle-token"
+    assert details["model_version"] == detection.model_service.model_version
+    assert details["feature_schema_version"] == detection.FEATURE_SCHEMA_VERSION
