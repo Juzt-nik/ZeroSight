@@ -2,6 +2,7 @@
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from typing import List, Dict, Any
+from datetime import datetime, timezone
 
 from backend.schemas.detection import (
     CANFrame, DetectionRequest, DetectionResult,
@@ -10,19 +11,10 @@ from backend.schemas.detection import (
 from backend.services.model_service import model_service
 from backend.services.audit_service import audit_service
 from backend.services.access_control import access_control, UserContext
+from backend.auth import get_current_user
 from backend.services.preprocessing import frame_to_dict
 
 router = APIRouter()
-
-
-def get_current_user() -> UserContext:
-    """Dependency: extract current user from request context.
-    In production, this would validate JWT/session tokens.
-    For demo, we accept a header X-User-Id and X-User-Role.
-    """
-    # This will be overridden by FastAPI dependency injection in main.py
-    # For now, return a default analyst context
-    return access_control.get_user("analyst_1") or UserContext(user_id="demo", roles={"analyst"})
 
 
 @router.post("", response_model=DetectionResult)
@@ -30,7 +22,11 @@ async def detect_single(
     request: DetectionRequest,
     current_user: UserContext = Depends(lambda: get_current_user()),
 ):
-    """Detect attack type for a single CAN frame."""
+    """Detect attack type for a single CAN frame.
+
+    P0-05: Uses window-level feature extractor via predict_window so training
+    and serving features are identical.
+    """
     if not access_control.require_permission(current_user, "detect:create"):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -44,7 +40,9 @@ async def detect_single(
         )
 
     frame_dict = frame_to_dict(request.frame)
-    prediction, confidence = await model_service.predict(frame_dict)
+    prediction, confidence, features_dict = await model_service.predict_window(
+        [frame_dict]
+    )
 
     # Log the detection as an audit event if it's an attack
     if prediction != "Normal":
@@ -57,15 +55,16 @@ async def detect_single(
                 "confidence": confidence,
                 "arbitration_id": request.frame.arbitration_id,
                 "vehicle_token": request.vehicle_token,
+                "features": features_dict,
             },
         )
 
     return DetectionResult(
         prediction=prediction,
         confidence=confidence,
-        features=model_service.extract_features(frame_dict).tolist()[0],
+        features=features_dict,
         model_version=model_service.model_version,
-        timestamp=__import__("datetime").datetime.now(__import__("datetime").timezone.utc),
+        timestamp=datetime.now(timezone.utc),
         vehicle_token=request.vehicle_token,
     )
 
@@ -75,7 +74,11 @@ async def detect_batch(
     request: BatchDetectionRequest,
     current_user: UserContext = Depends(lambda: get_current_user()),
 ):
-    """Detect attack types for multiple CAN frames."""
+    """Detect attack types for multiple CAN frames.
+
+    P0-05: Each frame is evaluated through the shared window-level feature
+    extractor for training/serving parity.
+    """
     if not access_control.require_permission(current_user, "detect:create"):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -108,12 +111,16 @@ async def detect_batch(
                     "batch_index": i,
                 },
             )
+        # Extract window-level features for each frame
+        _, _, features_dict = await model_service.predict_window(
+            [frame_to_dict(frame)]
+        )
         detection_results.append(DetectionResult(
             prediction=prediction,
             confidence=confidence,
-            features=model_service.extract_features(frame_to_dict(frame)).tolist()[0],
+            features=features_dict,
             model_version=model_service.model_version,
-            timestamp=__import__("datetime").datetime.now(__import__("datetime").timezone.utc),
+            timestamp=datetime.now(timezone.utc),
             vehicle_token=request.vehicle_token,
         ))
 

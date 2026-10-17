@@ -30,7 +30,7 @@ jobs:
         run: |
           pytest tests/ -v
 
-      - name: Run lint check (optional)
+      - name: Run lint check
         run: |
           pip install ruff
-          ruff check backend/ detection/ privacy/ access_control/ audit/ anomaly_detection/ scripts/ || true
+          ruff check backend/ detection/ privacy/ access_control/ audit/ anomaly_detection/ scripts/

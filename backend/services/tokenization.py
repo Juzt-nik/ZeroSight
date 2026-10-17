@@ -3,6 +3,10 @@
 Tokens are HMAC-SHA256(vehicle_id, rotation_key) truncated to 16 hex chars.
 Rotation keys change every configured interval (default 24h).
 Old tokens cannot be reversed without the historical key.
+
+P0-04: Tokens are generated inside the trusted pipeline from a verified
+vehicle identity. The TOKEN_SECRET must not be a known default outside
+demo mode; startup validation in backend/auth.py enforces this.
 """
 
 import os
@@ -16,6 +20,13 @@ logger = logging.getLogger("vsoc.tokenization")
 
 TOKEN_ROTATION_INTERVAL_HOURS = int(os.getenv("TOKEN_ROTATION_INTERVAL_HOURS", "24"))
 TOKEN_SECRET = os.getenv("TOKEN_SECRET", "change-me-token-secret")
+
+# Known unsafe defaults
+_UNSAFE_DEFAULTS = {"change-me-token-secret", "change-me", "secret", "development"}
+
+
+def _is_unsafe_default(secret: str) -> bool:
+    return secret in _UNSAFE_DEFAULTS or not secret or len(secret) < 16
 
 
 def _current_rotation_epoch() -> int:

@@ -5,12 +5,9 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from backend.services.anomaly_detector import anomaly_detector, AccessEvent
 from backend.services.audit_service import audit_service
 from backend.services.access_control import access_control, UserContext
+from backend.auth import get_current_user
 
 router = APIRouter()
-
-
-def get_current_user() -> UserContext:
-    return access_control.get_user("auditor_1") or UserContext(user_id="demo", roles={"auditor"})
 
 
 @router.get("/warnings")

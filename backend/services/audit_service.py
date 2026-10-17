@@ -20,7 +20,16 @@ import uuid
 from datetime import datetime, timezone
 from typing import Optional, List, Dict, Any
 
+from pathlib import Path
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
+from cryptography.hazmat.primitives.serialization import (
+    Encoding, PublicFormat, PrivateFormat, NoEncryption,
+)
+
 logger = logging.getLogger("vsoc.audit")
+
+CHECKPOINT_INTERVAL = int(os.getenv("AUDIT_CHECKPOINT_INTERVAL", "100"))
+CHECKPOINT_KEY_PATH = os.getenv("AUDIT_CHECKPOINT_KEY_PATH", "./data/audit_checkpoint_key.pem")
 
 
 class AuditService:
@@ -45,7 +54,21 @@ class AuditService:
                 sequence INTEGER PRIMARY KEY AUTOINCREMENT
             )
         """)
+        self._conn.execute("""
+            CREATE TABLE IF NOT EXISTS audit_checkpoints (
+                checkpoint_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                sequence INTEGER NOT NULL,
+                hash TEXT NOT NULL,
+                signature TEXT NOT NULL,
+                key_id TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+        """)
         self._conn.commit()
+
+        # Load or generate Ed25519 signing key for checkpoints
+        self._checkpoint_key = self._load_or_create_checkpoint_key()
+
         count = self._conn.execute("SELECT COUNT(*) FROM audit_events").fetchone()[0]
         if count == 0:
             await self._write_genesis()
@@ -57,6 +80,84 @@ class AuditService:
             outcome="success",
             details={"genesis": True},
         )
+
+    def _load_or_create_checkpoint_key(self) -> Ed25519PrivateKey:
+        """Load existing Ed25519 checkpoint key or generate a new one."""
+        key_path = Path(CHECKPOINT_KEY_PATH)
+        if key_path.exists():
+            try:
+                with open(key_path, "rb") as f:
+                    key_data = f.read()
+                from cryptography.hazmat.primitives.serialization import load_pem_private_key
+                key = load_pem_private_key(key_data, password=None)
+                if isinstance(key, Ed25519PrivateKey):
+                    return key
+            except Exception as exc:
+                logger.warning("Failed to load checkpoint key: %s; generating new", exc)
+
+        key = Ed25519PrivateKey.generate()
+        key_path.parent.mkdir(parents=True, exist_ok=True)
+        pem = key.private_bytes(
+            encoding=Encoding.PEM,
+            format=PrivateFormat.PKCS8,
+            encryption_algorithm=NoEncryption(),
+        )
+        with open(key_path, "wb") as f:
+            f.write(pem)
+        logger.info("Generated new Ed25519 checkpoint key at %s", key_path)
+        return key
+
+    def _get_checkpoint_public_key_pem(self) -> str:
+        """Return the public key PEM for checkpoint verification."""
+        public_key = self._checkpoint_key.public_key()
+        pem = public_key.public_bytes(
+            encoding=Encoding.PEM,
+            format=PublicFormat.SubjectPublicKeyInfo,
+        )
+        return pem.decode("utf-8")
+
+    def _create_checkpoint(self, sequence: int, chain_hash: str) -> None:
+        """Create a signed checkpoint at the given sequence."""
+        key_id = "ed25519-v1"
+        message = f"{sequence}|{chain_hash}".encode("utf-8")
+        signature = self._checkpoint_key.sign(message)
+        signature_hex = signature.hex()
+
+        self._conn.execute(
+            """
+            INSERT INTO audit_checkpoints
+            (sequence, hash, signature, key_id, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                sequence,
+                chain_hash,
+                signature_hex,
+                key_id,
+                datetime.now(timezone.utc).isoformat(),
+            ),
+        )
+        self._conn.commit()
+        logger.info("Created checkpoint at sequence %d", sequence)
+
+    def _verify_checkpoint(
+        self, sequence: int, chain_hash: str, signature_hex: str, key_id: str
+    ) -> bool:
+        """Verify a checkpoint signature independently."""
+        try:
+            from cryptography.hazmat.primitives.serialization import load_pem_private_key
+            key_path = Path(CHECKPOINT_KEY_PATH)
+            if not key_path.exists():
+                return False
+            with open(key_path, "rb") as f:
+                key_data = f.read()
+            key = load_pem_private_key(key_data, password=None)
+            public_key = key.public_key()
+            message = f"{sequence}|{chain_hash}".encode("utf-8")
+            public_key.verify(bytes.fromhex(signature_hex), message)
+            return True
+        except Exception:
+            return False
 
     def _compute_hash(
         self, prev_hash: str, event_id: str, event_type: str,
@@ -101,6 +202,15 @@ class AuditService:
         )
         self._conn.commit()
         logger.debug("Audit event logged: %s %s %s", event_type, actor, outcome)
+
+        # P2-01: Create periodic signed checkpoint
+        seq = self._conn.execute(
+            "SELECT sequence FROM audit_events ORDER BY sequence DESC LIMIT 1"
+        ).fetchone()[0]
+        if seq % CHECKPOINT_INTERVAL == 0:
+            last_hash = self._get_last_hash()
+            self._create_checkpoint(seq, last_hash)
+
         return event_id
 
     def get_events(
@@ -197,6 +307,42 @@ class AuditService:
             "message": (
                 "Chain is valid" if chain_valid
                 else f"Chain compromised: {len(tampered)} tampered record(s)"
+            ),
+        }
+
+    def verify_checkpoints(self) -> Dict[str, Any]:
+        """Verify all signed checkpoint signatures independently."""
+        if self._conn is None:
+            raise RuntimeError("Audit service not initialized")
+        rows = self._conn.execute(
+            "SELECT sequence, hash, signature, key_id FROM audit_checkpoints ORDER BY sequence ASC"
+        ).fetchall()
+        total = len(rows)
+        if total == 0:
+            return {
+                "checkpoints_valid": True,
+                "total_checkpoints": 0,
+                "verified_checkpoints": 0,
+                "failed_checkpoints": [],
+                "message": "No checkpoints",
+            }
+        verified = 0
+        failed: List[str] = []
+        for seq, chain_hash, signature_hex, key_id in rows:
+            if self._verify_checkpoint(seq, chain_hash, signature_hex, key_id):
+                verified += 1
+            else:
+                failed.append(str(seq))
+        all_valid = len(failed) == 0
+        return {
+            "checkpoints_valid": all_valid,
+            "total_checkpoints": total,
+            "verified_checkpoints": verified,
+            "failed_checkpoints": failed,
+            "message": (
+                "All checkpoints valid"
+                if all_valid
+                else f"{len(failed)} checkpoint(s) failed verification"
             ),
         }
 
