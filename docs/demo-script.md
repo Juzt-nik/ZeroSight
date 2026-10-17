@@ -1,9 +1,11 @@
 # Seven-Scene Demo and Exact Run Commands
 
 The dashboard sends a bearer token on each protected request and displays the
-principal returned by `/access/me`. In demo mode use tokens such as
-`analyst_1:analyst`, `sec_officer_1:security_officer`, and `auditor_1:auditor`.
-Use backend-issued JWTs outside demo mode.
+principal returned by `/access/me`. Demo mode accepts only the configured local
+principals: `analyst_1:analyst`, `sec_officer_1:security_officer`,
+`sec_officer_2:security_officer`, `sec_officer_3:security_officer`,
+`auditor_1:auditor`, and `admin_1:admin`. Other user or role claims are
+rejected. Use backend-issued JWTs outside demo mode.
 
 ## Repeatable local run (PowerShell)
 
@@ -35,13 +37,15 @@ streamlit run frontend/streamlit_app.py --server.port 8501
 ```
 
 Open `http://localhost:8501`. Switch to the second security-officer token for
-unmask approval. Use an auditor token for audit and anomaly scenes. The audit
+unmask approval. With `REQUIRED_APPROVERS=2`, the requester cannot approve and
+two other distinct security officers must approve (three officers participate).
+Use an auditor token for audit and anomaly scenes. The audit
 tamper action changes a database row; use a disposable demo database.
 
 ## Authenticated end-to-end/load run
 
 ```powershell
-$env:VSOC_API_TOKEN = "load_runner:analyst"
+$env:VSOC_API_TOKEN = "analyst_1:analyst"
 python tests/load/loadtest.py --url http://localhost:8000 --frames 1000 --concurrency 10 --output load_test_results.json
 ```
 
@@ -49,14 +53,15 @@ For per-attack accuracy and false-positive rate, supply JSONL cases containing
 actual ground-truth labels, one case per line:
 
 ```json
-{"frame":{"timestamp":1.0,"arbitration_id":"0316","dlc":8,"data_bytes":[5,33,104,9,33,33,0,111]},"label":"Normal"}
+{"frames":[{"timestamp":1.0,"arbitration_id":"0316","dlc":8,"data_bytes":[5,33,104,9,33,33,0,111]},{"timestamp":1.001,"arbitration_id":"0316","dlc":8,"data_bytes":[5,33,104,9,33,33,0,111]}],"label":"Normal"}
 ```
 
 ```powershell
 python tests/load/loadtest.py --url http://localhost:8000 --token $env:VSOC_API_TOKEN --input .\data\demo-cases.jsonl --concurrency 10 --output load_test_results.json
 ```
 
-The runner targets authenticated `POST /detect`. It reports server inference
+The runner targets authenticated `POST /detect/window`; each JSONL case carries
+the full frames from one window. It reports server inference
 latency separately from client HTTP round-trip latency, throughput, errors,
 per-label metrics, and false-positive rate on ground-truth `Normal` cases. The
 generated default probe is unlabeled, so it does not claim classification

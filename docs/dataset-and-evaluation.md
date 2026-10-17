@@ -13,7 +13,10 @@ The model pipeline uses the HCRL Car Hacking Dataset:
 | `normal_run_data.txt` | Normal |
 
 Place the five files in `data/raw/`. Run `python scripts/validate_dataset.py
-data/raw` to check for missing files, malformed frames, and unexpected labels.
+data/raw` to stream through each capture and report file sizes, row counts,
+label counts, malformed rows, and CAN ID/payload parsing. CSV and normal text
+capture formats are both supported; every payload must contain exactly DLC
+hexadecimal bytes.
 
 ## Features and split
 
@@ -23,8 +26,10 @@ builds message/unique-ID counts, lowest CAN ID, payload entropy, byte change
 rate, DLC statistics, timestamp span, unseen-ID count, and per-ID count and
 inter-arrival/frequency features.
 
-The backend sorts windows by time and uses a contiguous 80/20 train/test split.
-This is time-ordered evaluation; broader temporal leakage and cross-vehicle
+Training forms 100 ms buckets relative to each capture's first timestamp, so
+frames from different captures can never share a window. Captures are kept
+separate for the contiguous 80/20 train/test window split. This is
+time-ordered evaluation; broader temporal leakage and cross-vehicle
 generalization have not been established.
 
 ## Model and metrics

@@ -29,6 +29,7 @@ from detection.features import (
     WindowFeatureExtractor,
     FEATURE_VERSION as FEATURE_VERSION_STR,
 )
+from backend.services.preprocessing import parse_can_line
 
 # Record optional XGBoost availability, but the deployed baseline remains RF.
 try:
@@ -68,6 +69,7 @@ class ModelService:
         self._lock = asyncio.Lock()
         self.window_ms: float = 100.0
         self.feature_extractor: Optional[WindowFeatureExtractor] = None
+        self.feature_names: Optional[List[str]] = None
         self.model_metadata: Dict[str, Any] = {}
         self.use_ensemble: bool = USE_ENSEMBLE
 
@@ -81,7 +83,6 @@ class ModelService:
         metrics_path = self.model_dir / "metrics.json"
         metadata_path = self.model_dir / "metadata.json"
 
-        # Initialize feature extractor
         self.feature_extractor = WindowFeatureExtractor(window_ms=self.window_ms)
 
         if model_path.exists():
@@ -91,6 +92,9 @@ class ModelService:
                 if metadata_path.exists():
                     with open(metadata_path) as f:
                         self.model_metadata = json.load(f)
+                    self.window_ms = float(self.model_metadata.get("window_ms", self.window_ms))
+                    self.model_version = self.model_metadata.get("model_version", self.model_version)
+                    self.feature_extractor = WindowFeatureExtractor(window_ms=self.window_ms)
                     saved_feature_names = self.model_metadata.get("feature_names", [])
                     reference_can_ids = self.model_metadata.get("reference_can_ids")
                     if reference_can_ids is None:
@@ -102,6 +106,7 @@ class ModelService:
                             if name.startswith("per_id_count_")
                         ]
                     self.feature_extractor.reference_can_ids = set(reference_can_ids)
+                    self.feature_names = list(saved_feature_names) or None
                     # Verify artifact hash if recorded
                     saved_hash = self.model_metadata.get("artifact_hash")
                     if saved_hash and model_path.exists():
@@ -125,6 +130,14 @@ class ModelService:
                                 current_feature_names[:5],
                             )
                         )
+                if self.feature_names is None:
+                    self.feature_names = self.feature_extractor.feature_names()
+                if model.n_features_in_ != len(self.feature_names):
+                    raise RuntimeError(
+                        f"Model expects {model.n_features_in_} features but metadata defines {len(self.feature_names)}"
+                    )
+                self.model_metadata.setdefault("model_algorithm", model.__class__.__name__)
+                self.model_metadata["model_algorithm"] = model.__class__.__name__
                 if self.use_ensemble and if_path.exists():
                     try:
                         self.isolation_forest = joblib.load(if_path)
@@ -180,6 +193,8 @@ class ModelService:
 
             label = label_map[fname]
             df = self._load_can_csv(fpath, label)
+            if not df.empty:
+                df["capture_id"] = fname
             frames.append(df)
             logger.info("Loaded %s: %d rows, label=%s", fname, len(df), label)
 
@@ -200,6 +215,8 @@ class ModelService:
         split_idx = int(len(X) * 0.8)
         X_train, X_test = X[:split_idx], X[split_idx:]
         y_train, y_test = y[:split_idx], y[split_idx:]
+        if len(X_train) == 0 or len(X_test) == 0:
+            raise RuntimeError("Need at least two windows to create non-empty train and test splits")
 
         logger.info(
             "Train: %d samples, Test: %d samples (time-based split)",
@@ -218,10 +235,13 @@ class ModelService:
 
         y_pred = model.predict(X_test)
         metrics = self._compute_metrics(y_test, y_pred, model.classes_)
+        metrics["training_samples"] = int(len(y_train))
+        metrics["test_samples"] = int(len(y_test))
 
         self.model = model
         self.is_trained = True
         self.metrics = metrics
+        self.feature_names = feature_names
 
         # Save model, metrics, and metadata
         joblib.dump(model, model_path)
@@ -283,35 +303,14 @@ class ModelService:
                 line = line.strip()
                 if not line:
                     continue
-                parts = line.split(",")
-                if len(parts) < 4:
-                    continue
                 try:
-                    timestamp = float(parts[0])
-                    arbitration_id = parts[1]
-                    dlc = int(parts[2])
-                    data_bytes = []
-                    if len(parts) > 4:
-                        is_label = parts[-1] in ("R", "T", "A", "G", "F", "D",
-                                                 "Normal", "DoS", "Fuzzy", "Gear", "RPM")
-                        byte_parts = parts[3:-1] if is_label else parts[3:]
-                        for b in byte_parts:
-                            b = b.strip()
-                            if b:
-                                try:
-                                    is_hex = all(c in "0123456789abcdefABCDEF" for c in b)
-                                    data_bytes.append(int(b, 16) if is_hex else int(b))
-                                except ValueError:
-                                    data_bytes.append(0)
-                    label_from_file = parts[-1] if len(parts) >= 4 and parts[-1] in (
-                        "R", "T", "A", "G", "F", "D", "Normal", "DoS", "Fuzzy", "Gear", "RPM"
-                    ) else label
+                    parsed = parse_can_line(line)
                     rows.append({
-                        "timestamp": timestamp,
-                        "arbitration_id": arbitration_id,
-                        "dlc": dlc,
-                        "data_bytes": data_bytes,
-                        "label": label_from_file if label_from_file in CLASS_LABELS else label,
+                        "timestamp": parsed["timestamp"],
+                        "arbitration_id": parsed["arbitration_id"],
+                        "dlc": parsed["dlc"],
+                        "data_bytes": parsed["data_bytes"],
+                        "label": parsed["label"] if parsed["label"] in CLASS_LABELS else label,
                     })
                 except (ValueError, IndexError):
                     continue
@@ -327,7 +326,10 @@ class ModelService:
         if self.feature_extractor is None:
             self.feature_extractor = WindowFeatureExtractor(window_ms=self.window_ms)
 
-        df = df.sort_values("timestamp").reset_index(drop=True)
+        if "capture_id" not in df.columns:
+            df = df.copy()
+            df["capture_id"] = "capture"
+        df = df.sort_values(["capture_id", "timestamp"], kind="stable").reset_index(drop=True)
 
         # Collect reference CAN IDs from the data
         ref_ids = set(df["arbitration_id"].unique().tolist())
@@ -338,32 +340,21 @@ class ModelService:
             empty = np.zeros((1, len(self.feature_extractor.feature_names())))
             return empty, np.array(["Normal"]), self.feature_extractor.feature_names()
 
-        timestamps_ms = df["timestamp"].values * 1000.0
-        window_start = float(timestamps_ms.min())
-        window_end = float(timestamps_ms.max())
-
-        # Group frames into windows
         window_features: List[Dict[str, Any]] = []
         window_labels: List[str] = []
-
-        current_start = window_start
-        while current_start < window_end:
-            current_end = current_start + self.window_ms
-            mask = (timestamps_ms >= current_start) & (timestamps_ms < current_end)
-            window_df = df[mask]
-
-            if len(window_df) > 0:
-                frames_list = window_df.to_dict("records")
+        for _, capture in df.groupby("capture_id", sort=False):
+            capture = capture.sort_values("timestamp", kind="stable").copy()
+            times_ms = capture["timestamp"].to_numpy(dtype=float) * 1000.0
+            origin = float(times_ms[0])
+            buckets = np.floor((times_ms - origin) / self.window_ms).astype(np.int64)
+            for bucket in np.unique(buckets):
+                window_df = capture.iloc[np.flatnonzero(buckets == bucket)]
                 feats = self.feature_extractor.extract_window(
-                    frames_list, current_start
+                    window_df.to_dict("records"), origin + bucket * self.window_ms
                 )
-                # Majority label in window
-                labels = window_df["label"].values
-                majority_label = max(set(labels), key=list(labels).count)
+                labels = window_df["label"].tolist()
                 window_features.append(feats)
-                window_labels.append(majority_label)
-
-            current_start = current_end
+                window_labels.append(max(set(labels), key=labels.count))
 
         if not window_features:
             empty = np.zeros((1, len(self.feature_extractor.feature_names())))
@@ -407,8 +398,8 @@ class ModelService:
             "per_class": per_class,
             "confusion_matrix": cm.tolist(),
             "classes": CLASS_LABELS,
-            "training_samples": int(len(y_true) * 0.8),
-            "test_samples": int(len(y_true) * 0.2),
+            "training_samples": 0,
+            "test_samples": int(len(y_true)),
         }
 
     def extract_features(self, frames: List[Dict[str, Any]]) -> np.ndarray:
@@ -431,12 +422,14 @@ class ModelService:
             feature_names = self.feature_extractor.feature_names()
             return np.zeros((1, len(feature_names)), dtype=np.float32)
 
+        frames = sorted(frames, key=lambda frame: frame.get("timestamp", 0.0))
+
         # Use the earliest frame timestamp as window start
         timestamps = [f.get("timestamp", 0.0) for f in frames]
         window_start_ms = min(timestamps) * 1000.0 if timestamps else 0.0
 
         feats = self.feature_extractor.extract_window(frames, window_start_ms)
-        feature_names = self.feature_extractor.feature_names()
+        feature_names = self.feature_names or self.feature_extractor.feature_names()
         return self.feature_extractor.to_vector(feats, feature_names)
 
     async def predict_window(
@@ -462,7 +455,7 @@ class ModelService:
                     prediction = "Anomaly"
                     confidence = float(max(confidence, abs(anomaly_score)))
 
-            feature_names = self.feature_extractor.feature_names() if self.feature_extractor else []
+            feature_names = self.feature_names or (self.feature_extractor.feature_names() if self.feature_extractor else [])
             features_dict = {
                 name: float(X[0][i]) for i, name in enumerate(feature_names)
             }

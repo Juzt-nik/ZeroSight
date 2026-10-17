@@ -4,6 +4,7 @@ Shared between detection service and detection CLI scripts.
 """
 
 import numpy as np
+import re
 from typing import Dict, Any, List
 
 
@@ -16,34 +17,53 @@ def parse_can_line(line: str) -> Dict[str, Any]:
     if not line:
         raise ValueError("Empty line")
 
-    parts = line.split(",")
-    if len(parts) < 4:
+    # HCRL attack captures are CSV; the normal capture uses a labeled text
+    # format: Timestamp: ... ID: ... 000 DLC: ... <hex bytes>.
+    text_match = re.match(
+        r"^Timestamp:\s*([0-9.eE+-]+)\s+ID:\s*([0-9a-fA-F]+)\s+\S+\s+DLC:\s*(\d+)\s*(.*?)\s*$",
+        line,
+    )
+    if text_match:
+        timestamp, arbitration_id, dlc, payload = text_match.groups()
+        parts = [timestamp, arbitration_id, dlc, *payload.split()]
+    else:
+        parts = [part.strip() for part in line.split(",")]
+    if len(parts) < 3:
         raise ValueError(f"Too few fields: {len(parts)}")
 
     timestamp = float(parts[0])
-    arbitration_id = parts[1]
+    if not np.isfinite(timestamp) or timestamp < 0:
+        raise ValueError("Timestamp must be finite and non-negative")
+    arbitration_id = parts[1].strip().lower()
+    try:
+        can_id = int(arbitration_id, 16)
+    except ValueError as exc:
+        raise ValueError(f"Invalid CAN ID: {arbitration_id}") from exc
+    if can_id < 0 or can_id > 0x1FFFFFFF:
+        raise ValueError(f"CAN ID out of range: {arbitration_id}")
     dlc = int(parts[2])
+    if not 0 <= dlc <= 8:
+        raise ValueError(f"DLC must be between 0 and 8: {dlc}")
 
-    # Data bytes: parts[3:-1] if last field is a label, else parts[3:]
+    # Use DLC and field count to distinguish an optional label from a final
+    # payload byte whose one-character hex value happens to be e.g. "A".
     data_bytes: List[int] = []
     label = None
+    if len(parts) == 3 + dlc:
+        byte_parts = parts[3:]
+    elif len(parts) == 4 + dlc:
+        label = parts[-1]
+        if label not in ("R", "T", "A", "G", "F", "D", "Normal", "DoS", "Fuzzy", "Gear", "RPM"):
+            raise ValueError(f"Unknown label: {label}")
+        byte_parts = parts[3:-1]
+    else:
+        raise ValueError(f"DLC is {dlc}, but row has {len(parts) - 3} payload/label fields")
 
-    if len(parts) >= 5:
-        # Last part might be a label
-        last = parts[-1]
-        if last in ("R", "T", "A", "G", "F", "D", "Normal", "DoS", "Fuzzy", "Gear", "RPM"):
-            label = last
-            byte_parts = parts[3:-1]
-        else:
-            byte_parts = parts[3:]
-
-        for b in byte_parts:
-            b = b.strip()
-            if b:
-                try:
-                    data_bytes.append(int(b, 16) if all(c in "0123456789abcdefABCDEF" for c in b) else int(b))
-                except ValueError:
-                    data_bytes.append(0)
+    for b in byte_parts:
+        b = b.strip()
+        if not re.fullmatch(r"(?:0x)?[0-9a-fA-F]{1,2}", b):
+            raise ValueError(f"Invalid CAN payload byte: {b!r}")
+        data_bytes.append(int(b, 16))
 
     return {
         "timestamp": timestamp,

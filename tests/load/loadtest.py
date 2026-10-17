@@ -1,4 +1,4 @@
-"""Authenticated load and labeled end-to-end evaluation for POST /detect."""
+"""Authenticated load and labeled end-to-end evaluation for POST /detect/window."""
 
 import argparse
 import asyncio
@@ -27,8 +27,8 @@ def read_cases(path: Path | None, count: int) -> list[dict[str, Any]]:
         return cases
     now = datetime.now(timezone.utc).timestamp()
     # Unlabeled repeatable probe. Never treat a synthetic label as ground truth.
-    return [{"frame": {"timestamp": now + i * 0.001, "arbitration_id": "0316", "dlc": 8,
-                       "data_bytes": [5, 33, 104, 9, 33, 33, 0, 111]}}
+    return [{"frames": [{"timestamp": now + i * 0.1 + j * 0.001, "arbitration_id": "0316", "dlc": 8,
+                         "data_bytes": [5, 33, 104, 9, 33, 33, 0, 111]} for j in range(8)]}
             for i in range(count)]
 
 
@@ -41,10 +41,12 @@ async def run(base_url: str, token: str, cases: list[dict[str, Any]], concurrenc
     async with httpx.AsyncClient(headers=headers, timeout=15.0) as client:
         async def send(case: dict[str, Any]):
             async with semaphore:
-                payload = {key: value for key, value in case.items() if key in ("frame", "vehicle_token")}
+                payload = {key: value for key, value in case.items() if key in ("frames", "vehicle_token")}
+                if "frames" not in payload and "frame" in case:
+                    payload["frames"] = [case["frame"]]
                 begin = time.perf_counter()
                 try:
-                    response = await client.post(f"{base_url.rstrip('/')}/detect", json=payload)
+                    response = await client.post(f"{base_url.rstrip('/')}/detect/window", json=payload)
                     elapsed_ms = (time.perf_counter() - begin) * 1000
                     try:
                         body = response.json()
@@ -79,7 +81,7 @@ async def run(base_url: str, token: str, cases: list[dict[str, Any]], concurrenc
     normal = [sample for sample in labeled if sample["label"] == "Normal"]
     false_positives = sum(sample["prediction"] != "Normal" for sample in normal)
     return {
-        "endpoint": "POST /detect", "total_requests": len(samples), "successes": len(succeeded),
+        "endpoint": "POST /detect/window", "total_requests": len(samples), "successes": len(succeeded),
         "errors": len(samples) - len(succeeded), "error_rate": (len(samples) - len(succeeded)) / len(samples),
         "throughput_rps": round(len(samples) / duration, 2) if duration else 0,
         "latency_ms": {"p50": round(percentile(latencies, .50), 2), "p95": round(percentile(latencies, .95), 2),
@@ -100,12 +102,12 @@ async def run(base_url: str, token: str, cases: list[dict[str, Any]], concurrenc
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Authenticated vSOC /detect load and labeled end-to-end run")
+    parser = argparse.ArgumentParser(description="Authenticated vSOC window inference load and labeled end-to-end run")
     parser.add_argument("--url", default=os.getenv("BACKEND_URL", "http://localhost:8000"))
     parser.add_argument("--token", default=os.getenv("VSOC_API_TOKEN"), help="Bearer token (or set VSOC_API_TOKEN)")
     parser.add_argument("--frames", type=int, default=1000, help="Unlabeled probe count when --input is omitted")
     parser.add_argument("--concurrency", type=int, default=10)
-    parser.add_argument("--input", type=Path, help="JSONL cases: each line {frame:{...}, label:'Normal'|'DoS'|...}")
+    parser.add_argument("--input", type=Path, help="JSONL cases: each line {frames:[...], label:'Normal'|'DoS'|...}")
     parser.add_argument("--output", type=Path, default=Path("load_test_results.json"))
     args = parser.parse_args()
     if not args.token:

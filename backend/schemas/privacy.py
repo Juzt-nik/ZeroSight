@@ -1,7 +1,7 @@
 """Pydantic schemas for privacy-related API routes."""
 
 from datetime import datetime
-from typing import Optional
+from typing import Optional, Literal
 
 from pydantic import BaseModel, Field
 
@@ -20,8 +20,8 @@ class TokenizeResponse(BaseModel):
 class LocationCoarsenRequest(BaseModel):
     latitude: float = Field(..., ge=-90, le=90)
     longitude: float = Field(..., ge=-180, le=180)
-    minimization_level: Optional[str] = Field(
-        default="coarsen", description="none | coarsen | withhold"
+    minimization_level: Optional[Literal["coarsen", "withhold"]] = Field(
+        default="coarsen", description="coarsen | withhold; raw location is never returned"
     )
 
 

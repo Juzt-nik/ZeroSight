@@ -281,7 +281,7 @@ def test_access_me_resolves_async_auth_dependency(monkeypatch):
         "/access/me",
         headers={
             "Authorization": _bearer(
-                "dependency-test-analyst",
+                "analyst_1",
                 "analyst",
             ),
         },
@@ -291,7 +291,7 @@ def test_access_me_resolves_async_auth_dependency(monkeypatch):
 
     data = response.json()
 
-    assert data["user_id"] == "dependency-test-analyst"
+    assert data["user_id"] == "analyst_1"
     assert data["roles"] == ["analyst"]
     assert data["is_authenticated"] is True
 
@@ -306,7 +306,7 @@ def test_access_roles_enforces_permissions(monkeypatch):
         "/access/roles",
         headers={
             "Authorization": _bearer(
-                "dependency-test-analyst",
+                "analyst_1",
                 "analyst",
             ),
         },
@@ -319,7 +319,7 @@ def test_access_roles_enforces_permissions(monkeypatch):
         "/access/roles",
         headers={
             "Authorization": _bearer(
-                "dependency-test-auditor",
+                "auditor_1",
                 "auditor",
             ),
         },

@@ -8,6 +8,7 @@ from time import perf_counter
 from backend.schemas.detection import (
     CANFrame, DetectionRequest, DetectionResult,
     BatchDetectionRequest, BatchDetectionResult, ModelMetrics,
+    WindowDetectionRequest,
 )
 from backend.services.model_service import model_service
 from backend.services.audit_service import audit_service
@@ -142,6 +143,39 @@ async def detect_batch(
 
     summary = {"total": len(detection_results), "attacks": attack_count, "normal": len(detection_results) - attack_count}
     return BatchDetectionResult(results=detection_results, summary=summary)
+
+
+@router.post("/window", response_model=DetectionResult)
+async def detect_window(
+    request: WindowDetectionRequest,
+    current_user: UserContext = Depends(get_current_user),
+):
+    """Infer once from every frame in one complete time window."""
+    if not access_control.require_permission(current_user, "detect:create"):
+        raise HTTPException(status_code=403, detail="Insufficient permissions for detection")
+    if not model_service.is_loaded():
+        raise HTTPException(status_code=503, detail="Model not loaded")
+    timestamps = [frame.timestamp for frame in request.frames]
+    window_ms = float(model_service.model_metadata.get("window_ms", model_service.window_ms))
+    if max(timestamps) - min(timestamps) > window_ms / 1000.0:
+        raise HTTPException(status_code=422, detail=f"Frames span more than one {window_ms:g} ms window")
+    frame_dicts = [frame_to_dict(frame) for frame in request.frames]
+    started = perf_counter()
+    prediction, confidence, features = await model_service.predict_window(frame_dicts)
+    latency = (perf_counter() - started) * 1000
+    if prediction != "Normal":
+        await audit_service.log_event(
+            event_type="attack_alert", actor=current_user.user_id, outcome="success",
+            details={"prediction": prediction, "model_version": model_service.model_version,
+                     "feature_schema_version": FEATURE_SCHEMA_VERSION, "confidence": confidence,
+                     "frame_count": len(frame_dicts), "vehicle_token": request.vehicle_token,
+                     "features": features},
+        )
+    return DetectionResult(
+        prediction=prediction, confidence=confidence, features=features,
+        model_version=model_service.model_version, timestamp=datetime.now(timezone.utc),
+        vehicle_token=request.vehicle_token, inference_latency_ms=latency,
+    )
 
 
 @router.get("/metrics", response_model=ModelMetrics)

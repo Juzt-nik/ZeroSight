@@ -10,6 +10,7 @@ Usage:
 
 import json
 import sys
+from collections import Counter
 from pathlib import Path
 from typing import Dict, Any, List, Tuple
 from backend.services.preprocessing import parse_can_line
@@ -38,39 +39,43 @@ def validate_file(fpath: Path) -> Dict[str, Any]:
         "labels_found": set(),
         "unexpected_labels": [],
         "can_ids": set(),
+        "label_counts": Counter(),
+        "size_bytes": fpath.stat().st_size if fpath.exists() else 0,
         "errors": [],
+        "errors_truncated": False,
     }
 
     if not fpath.exists():
         result["errors"].append(f"File not found: {fpath}")
         return result
 
+    expected_label = FILE_LABEL_MAP.get(fpath.name)
     try:
         with open(fpath, "r") as f:
-            lines = f.readlines()
+            result["readable"] = True
+            for i, line in enumerate(f, 1):
+                result["row_count"] += 1
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    parsed = parse_can_line(line)
+                    result["valid_rows"] += 1
+                    label = parsed.get("label") if parsed.get("label") in EXPECTED_LABELS else expected_label
+                    if label:
+                        result["labels_found"].add(label)
+                        result["label_counts"][label] += 1
+                    if parsed.get("arbitration_id"):
+                        result["can_ids"].add(parsed["arbitration_id"])
+                except ValueError as exc:
+                    result["invalid_rows"] += 1
+                    if len(result["errors"]) < 100:
+                        result["errors"].append(f"Line {i}: {exc}")
+                    else:
+                        result["errors_truncated"] = True
     except Exception as exc:
         result["errors"].append(f"Cannot read file: {exc}")
         return result
-
-    result["readable"] = True
-    result["row_count"] = len(lines)
-
-    expected_label = FILE_LABEL_MAP.get(fpath.name)
-
-    for i, line in enumerate(lines, 1):
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            parsed = parse_can_line(line)
-            result["valid_rows"] += 1
-            if parsed.get("label"):
-                result["labels_found"].add(parsed["label"])
-            if parsed.get("arbitration_id"):
-                result["can_ids"].add(parsed["arbitration_id"])
-        except ValueError as exc:
-            result["invalid_rows"] += 1
-            result["errors"].append(f"Line {i}: {exc}")
 
     # Check for unexpected labels
     if expected_label:
@@ -81,6 +86,7 @@ def validate_file(fpath: Path) -> Dict[str, Any]:
     # Convert sets to sorted lists for JSON serialization
     result["labels_found"] = sorted(result["labels_found"])
     result["can_ids"] = sorted(result["can_ids"])
+    result["label_counts"] = dict(result["label_counts"])
 
     return result
 

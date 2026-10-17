@@ -1,7 +1,7 @@
 """Schemas for detection module."""
 
 from pydantic import BaseModel, Field, field_validator
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Literal
 from datetime import datetime
 
 
@@ -11,10 +11,10 @@ class CANFrame(BaseModel):
     arbitration_id: str = Field(..., description="CAN ID in hex, e.g. '0316'")
     dlc: int = Field(..., ge=0, le=15, description="Data length code")
     data_bytes: List[int] = Field(
-        ..., min_length=0, max_length=64,
-        description="CAN data bytes (0-255 each)"
+        ..., min_length=0, max_length=8,
+        description="Classical CAN payload bytes (0-255 each)"
     )
-    label: Optional[str] = Field(
+    label: Optional[Literal["Normal", "DoS", "Fuzzy", "Gear", "RPM", "R", "T", "A", "G", "F", "D"]] = Field(
         default=None, description="Ground truth label (Normal/DoS/Fuzzy/Gear/RPM)"
     )
 
@@ -26,14 +26,24 @@ class CANFrame(BaseModel):
                 raise ValueError(f"Byte value {b} out of range 0-255")
         return v
 
+    @field_validator("data_bytes")
+    @classmethod
+    def validate_dlc_matches_payload(cls, v, info):
+        dlc = info.data.get("dlc")
+        if dlc is not None and len(v) != dlc:
+            raise ValueError(f"DLC is {dlc}, but payload contains {len(v)} bytes")
+        return v
+
     @field_validator("arbitration_id")
     @classmethod
     def validate_can_id(cls, v):
         try:
-            int(v, 16)
+            parsed = int(v, 16)
         except ValueError:
             raise ValueError(f"Invalid CAN arbitration_id: {v}")
-        return v
+        if parsed < 0 or parsed > 0x1FFFFFFF:
+            raise ValueError(f"CAN arbitration_id is out of range: {v}")
+        return v.lower()
 
 
 class DetectionRequest(BaseModel):
@@ -63,6 +73,12 @@ class DetectionResult(BaseModel):
 class BatchDetectionRequest(BaseModel):
     """Request to detect multiple CAN frames."""
     frames: List[CANFrame]
+    vehicle_token: Optional[str] = None
+
+
+class WindowDetectionRequest(BaseModel):
+    """All CAN frames belonging to one bounded inference window."""
+    frames: List[CANFrame] = Field(..., min_length=1, max_length=4096)
     vehicle_token: Optional[str] = None
 
 

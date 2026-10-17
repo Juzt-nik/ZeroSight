@@ -2,6 +2,7 @@
 
 import os
 import time
+import json
 
 import pandas as pd
 import requests
@@ -72,22 +73,22 @@ scene = st.sidebar.radio("Demo scene", [
 
 if scene == "1 · Detect CAN attack":
     st.header(scene)
-    st.write("Submit one CAN frame to the model. Attack predictions are written to the audit log.")
+    st.write("Submit every frame from one 100 ms CAN window. Alert classifications come from the model output.")
     with st.form("detect"):
-        timestamp = st.number_input("Unix timestamp", value=1478198376.389427, format="%.6f")
-        arbitration_id = st.text_input("Arbitration ID (hex)", "0316")
-        dlc = st.number_input("DLC", min_value=0, max_value=15, value=8)
-        raw_bytes = st.text_input("Data bytes (hex, comma separated)", "05,21,68,09,21,21,00,6f")
+        default_frames = [
+            {"timestamp": 1478198376.389427 + i * 0.001, "arbitration_id": "0316", "dlc": 8,
+             "data_bytes": [5, 33, 104, 9, 33, 33, 0, 111]} for i in range(8)
+        ]
+        frames_json = st.text_area("Window frames (JSON array)", json.dumps(default_frames, indent=2), height=260)
         vehicle_token = st.text_input("Vehicle token (optional)")
         submit = st.form_submit_button("Run detection")
     if submit:
         try:
-            data_bytes = [int(value.strip(), 16) for value in raw_bytes.split(",") if value.strip()]
+            frames = json.loads(frames_json)
+            if not isinstance(frames, list) or not frames:
+                raise ValueError("Enter a non-empty JSON array of frames")
             started = time.perf_counter()
-            result = api_request("POST", "/detect", payload={"frame": {
-                "timestamp": timestamp, "arbitration_id": arbitration_id,
-                "dlc": int(dlc), "data_bytes": data_bytes,
-            }, "vehicle_token": vehicle_token or None})
+            result = api_request("POST", "/detect/window", payload={"frames": frames, "vehicle_token": vehicle_token or None})
             elapsed = (time.perf_counter() - started) * 1000
             if result:
                 st.metric("Prediction", result["prediction"])
@@ -95,8 +96,8 @@ if scene == "1 · Detect CAN attack":
                 st.metric("Server inference", f"{result.get('inference_latency_ms', 0):.2f} ms")
                 st.metric("HTTP round trip", f"{elapsed:.2f} ms")
                 st.json(result)
-        except ValueError:
-            st.error("Enter each data byte as a hexadecimal value.")
+        except (ValueError, TypeError) as exc:
+            st.error(f"Enter valid JSON frames with byte values from 0 to 255: {exc}")
 
 elif scene == "2 · Tokenize vehicle":
     st.header(scene)
@@ -116,7 +117,7 @@ elif scene == "3 · Minimize location":
     with st.form("location"):
         latitude = st.number_input("Latitude", value=40.7128, min_value=-90.0, max_value=90.0, format="%.6f")
         longitude = st.number_input("Longitude", value=-74.0060, min_value=-180.0, max_value=180.0, format="%.6f")
-        level = st.selectbox("Policy", ["coarsen", "withhold", "none"])
+        level = st.selectbox("Policy", ["coarsen", "withhold"])
         submit = st.form_submit_button("Apply minimization")
     if submit:
         result = api_request("POST", "/privacy/location/coarsen", payload={

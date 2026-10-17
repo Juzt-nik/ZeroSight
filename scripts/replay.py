@@ -96,12 +96,14 @@ class ReplaySimulator:
             "RPM_dataset.csv": "RPM",
             "normal_run_data.txt": "Normal",
         }
+        selected_labels = set(attack_segments) if attack_segments else {"Normal"}
         for fname, label in label_map.items():
-            if attack_segments and label not in attack_segments:
+            if label not in selected_labels:
                 continue
             fpath = self.data_dir / fname
             if not fpath.exists():
                 continue
+            capture_frames = []
             with open(fpath, "r") as f:
                 for line in f:
                     line = line.strip()
@@ -109,15 +111,29 @@ class ReplaySimulator:
                         continue
                     try:
                         parsed = parse_can_line(line)
-                        schedule.append({
+                        capture_frames.append({
                             "timestamp": parsed["timestamp"],
                             "arbitration_id": parsed["arbitration_id"],
                             "dlc": parsed["dlc"],
                             "data_bytes": parsed["data_bytes"],
-                            "ground_truth": parsed.get("label", label),
+                            "ground_truth": parsed.get("label") if parsed.get("label") in ("Normal", "DoS", "Fuzzy", "Gear", "RPM") else label,
                         })
                     except ValueError:
                         continue
+            capture_frames.sort(key=lambda x: x["timestamp"])
+            if capture_frames:
+                origin = capture_frames[0]["timestamp"]
+                buckets: Dict[int, List[Dict[str, Any]]] = {}
+                for frame in capture_frames:
+                    bucket = int((frame["timestamp"] - origin) * 1000 // model_service.window_ms)
+                    buckets.setdefault(bucket, []).append(frame)
+                for bucket, window_frames in buckets.items():
+                    labels = [frame["ground_truth"] for frame in window_frames]
+                    schedule.append({
+                        "timestamp": window_frames[0]["timestamp"],
+                        "frames": window_frames,
+                        "ground_truth": max(set(labels), key=labels.count),
+                    })
         schedule.sort(key=lambda x: x["timestamp"])
         return schedule
 
@@ -129,14 +145,9 @@ class ReplaySimulator:
         lat, lon = self.vehicle_gps[vehicle_vin]
         location = coarsen_location(lat, lon, minimization_level="coarsen")
 
-        frame = {
-            "timestamp": segment["timestamp"],
-            "arbitration_id": segment["arbitration_id"],
-            "dlc": segment["dlc"],
-            "data_bytes": segment["data_bytes"],
-        }
-
-        prediction, confidence, features = await model_service.predict_window([frame])
+        frames = [{key: frame[key] for key in ("timestamp", "arbitration_id", "dlc", "data_bytes")}
+                  for frame in segment["frames"]]
+        prediction, confidence, features = await model_service.predict_window(frames)
 
         alert = None
         if prediction != "Normal":
@@ -147,7 +158,8 @@ class ReplaySimulator:
                 details={
                     "prediction": prediction,
                     "confidence": confidence,
-                    "arbitration_id": segment["arbitration_id"],
+                    "arbitration_ids": sorted({frame["arbitration_id"] for frame in segment["frames"]}),
+                    "frame_count": len(frames),
                     "vehicle_token": vehicle_token,
                     "ground_truth": segment["ground_truth"],
                     "features": features,
@@ -157,7 +169,8 @@ class ReplaySimulator:
             alert = {
                 "prediction": prediction,
                 "confidence": confidence,
-                "arbitration_id": segment["arbitration_id"],
+                "arbitration_ids": sorted({frame["arbitration_id"] for frame in segment["frames"]}),
+                "frame_count": len(frames),
                 "vehicle_token": vehicle_token,
                 "ground_truth": segment["ground_truth"],
                 "timestamp": segment["timestamp"],

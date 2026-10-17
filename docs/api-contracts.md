@@ -14,8 +14,9 @@
 ### Detection
 | Method | Path | Auth | Description |
 |--------|------|------|-------------|
-| POST | `/detect` | analyst | Single frame inference |
-| POST | `/detect/batch` | analyst | Batch inference |
+| POST | `/detect` | analyst | Legacy single-frame inference |
+| POST | `/detect/window` | analyst | One prediction from all frames in one bounded time window |
+| POST | `/detect/batch` | analyst | Legacy per-frame batch inference |
 | GET | `/detect/metrics` | analyst | Model metrics |
 
 Detection responses include `inference_latency_ms`, the server-side duration

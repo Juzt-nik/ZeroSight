@@ -33,6 +33,14 @@ ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "60")
 
 # Known unsafe defaults that must never be used outside demo mode.
 _UNSAFE_DEFAULTS = {"change-me-token-secret", "change-me", "secret", "development"}
+_DEMO_PRINCIPALS = {
+    "analyst_1": {"analyst"},
+    "sec_officer_1": {"security_officer"},
+    "sec_officer_2": {"security_officer"},
+    "sec_officer_3": {"security_officer"},
+    "auditor_1": {"auditor"},
+    "admin_1": {"admin"},
+}
 
 
 def _is_unsafe_default(secret: str) -> bool:
@@ -118,10 +126,17 @@ async def get_current_user(
                 detail="Invalid token payload",
                 headers={"WWW-Authenticate": "Bearer"},
             )
-        # Register on demand so role lookups work across route modules
+        # Demo credentials are a fixed local-only allowlist. Never trust a role
+        # supplied by an arbitrary bearer token.
+        if user_id not in _DEMO_PRINCIPALS or set(roles) != _DEMO_PRINCIPALS[user_id]:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid demo credentials",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
         existing = access_control.get_user(user_id)
         if existing is None:
-            access_control.register_user(user_id, roles)
+            access_control.register_user(user_id, sorted(_DEMO_PRINCIPALS[user_id]))
         ctx = access_control.get_user(user_id)
         if ctx is None:
             raise HTTPException(

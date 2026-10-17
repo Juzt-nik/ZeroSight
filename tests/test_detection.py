@@ -28,6 +28,34 @@ def test_parse_can_line_malformed():
         parse_can_line("too,few,fields")
 
 
+def test_parse_normal_capture_format_and_reject_bad_payload():
+    parsed = parse_can_line(
+        "Timestamp: 1479121434.850202 ID: 0350 000 DLC: 8 05 28 84 66 6d 00 00 a2"
+    )
+    assert parsed["arbitration_id"] == "0350"
+    assert parsed["data_bytes"] == [5, 40, 132, 102, 109, 0, 0, 162]
+    with pytest.raises(ValueError, match="payload byte"):
+        parse_can_line("1.0,0316,2,05,zz,R")
+    with pytest.raises(ValueError, match="payload byte"):
+        parse_can_line("1.0,0316,2,05,R")
+
+
+def test_windows_never_combine_separate_captures():
+    service = ModelService()
+    service.feature_extractor = __import__(
+        "detection.features", fromlist=["WindowFeatureExtractor"]
+    ).WindowFeatureExtractor(window_ms=100.0)
+    df = __import__("pandas").DataFrame([
+        {"capture_id": "capture-a", "timestamp": 1.0, "arbitration_id": "0316", "dlc": 1,
+         "data_bytes": [1], "label": "Normal"},
+        {"capture_id": "capture-b", "timestamp": 1.0, "arbitration_id": "0260", "dlc": 1,
+         "data_bytes": [2], "label": "DoS"},
+    ])
+    X, y, _ = service._engineer_features(df)
+    assert X.shape[0] == 2
+    assert set(y) == {"Normal", "DoS"}
+
+
 def test_model_initializes(tmp_path, monkeypatch):
     """ModelService.initialize() loads a saved artifact or fails safely."""
     model_dir = tmp_path / "models"
