@@ -20,7 +20,7 @@ router = APIRouter()
 @router.post("", response_model=DetectionResult)
 async def detect_single(
     request: DetectionRequest,
-    current_user: UserContext = Depends(lambda: get_current_user()),
+    current_user: UserContext = Depends(get_current_user),
 ):
     """Detect attack type for a single CAN frame.
 
@@ -72,7 +72,7 @@ async def detect_single(
 @router.post("/batch", response_model=BatchDetectionResult)
 async def detect_batch(
     request: BatchDetectionRequest,
-    current_user: UserContext = Depends(lambda: get_current_user()),
+    current_user: UserContext = Depends(get_current_user),
 ):
     """Detect attack types for multiple CAN frames.
 
@@ -130,7 +130,7 @@ async def detect_batch(
 
 @router.get("/metrics", response_model=ModelMetrics)
 async def get_metrics(
-    current_user: UserContext = Depends(lambda: get_current_user()),
+    current_user: UserContext = Depends(get_current_user),
 ):
     """Get model evaluation metrics."""
     if not access_control.require_permission(current_user, "detect:read"):

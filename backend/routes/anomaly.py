@@ -12,7 +12,7 @@ router = APIRouter()
 
 @router.get("/warnings")
 async def get_anomaly_warnings(
-    current_user: UserContext = Depends(lambda: get_current_user()),
+    current_user: UserContext = Depends(get_current_user),
 ):
     """Get current access anomaly warnings (auditor only)."""
     if not access_control.require_permission(current_user, "anomaly:read"):
@@ -29,7 +29,7 @@ async def record_access_event(
     user_id: str,
     action: str,
     outcome: str,
-    current_user: UserContext = Depends(lambda: get_current_user()),
+    current_user: UserContext = Depends(get_current_user),
 ):
     """Record an access event for anomaly analysis."""
     if not access_control.require_permission(current_user, "anomaly:read"):
