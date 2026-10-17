@@ -32,6 +32,7 @@ data/*.csv
 data/*.txt
 data/*.7z
 data/*.zip
+data/raw/
 models/*.pkl
 models/*.joblib
 *.db

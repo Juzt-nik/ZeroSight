@@ -18,6 +18,12 @@
 | POST | `/detect/batch` | analyst | Batch inference |
 | GET | `/detect/metrics` | analyst | Model metrics |
 
+Detection responses include `inference_latency_ms`, the server-side duration
+of the `predict_window` call in milliseconds. It excludes request/network
+overhead and includes any wait for the model's inference lock.
+Attack audit events include `model_version` and `feature_schema_version`
+(`can-window-v1`) for model and feature provenance.
+
 ### Privacy
 | Method | Path | Auth | Description |
 |--------|------|------|-------------|
@@ -44,6 +50,15 @@
 | Method | Path | Auth | Description |
 |--------|------|------|-------------|
 | GET | `/anomaly/warnings` | auditor | Access anomaly warnings |
+| POST | `/anomaly/record-event?user_id=...&action=...&outcome=...` | auditor | Record a caller's own demo access event |
+
+The record-event route requires `user_id` to match the authenticated principal;
+attempts to attribute events to another account return 403. Persisted security
+events also feed anomaly monitoring from the audit event listener. On startup,
+the most recent 10,000 audit events are replayed into the in-memory detector so
+warnings survive a service restart (within that replay window). Manual demo
+events are inserted into the detector once and are not double-counted by the
+audit listener.
 
 ## Roles
 - **analyst** — detection, tokenization, location coarsening

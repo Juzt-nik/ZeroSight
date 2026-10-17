@@ -3,6 +3,7 @@
 from fastapi import APIRouter, Depends, HTTPException, status
 from typing import List, Dict, Any
 from datetime import datetime, timezone
+from time import perf_counter
 
 from backend.schemas.detection import (
     CANFrame, DetectionRequest, DetectionResult,
@@ -43,9 +44,11 @@ async def detect_single(
         )
 
     frame_dict = frame_to_dict(request.frame)
+    inference_started = perf_counter()
     prediction, confidence, features_dict = await model_service.predict_window(
         [frame_dict]
     )
+    inference_latency_ms = (perf_counter() - inference_started) * 1000
 
     # Log the detection as an audit event if it's an attack
     if prediction != "Normal":
@@ -55,8 +58,8 @@ async def detect_single(
             outcome="success",
             details={
                 "prediction": prediction,
-                    "model_version": model_service.model_version,
-                    "feature_schema_version": FEATURE_SCHEMA_VERSION,
+                "model_version": model_service.model_version,
+                "feature_schema_version": FEATURE_SCHEMA_VERSION,
                 "confidence": confidence,
                 "arbitration_id": request.frame.arbitration_id,
                 "vehicle_token": request.vehicle_token,
@@ -71,6 +74,7 @@ async def detect_single(
         model_version=model_service.model_version,
         timestamp=datetime.now(timezone.utc),
         vehicle_token=request.vehicle_token,
+        inference_latency_ms=inference_latency_ms,
     )
 
 
@@ -96,12 +100,20 @@ async def detect_batch(
             detail="Model not loaded",
         )
 
-    frame_dicts = [frame_to_dict(f) for f in request.frames]
-    results = await model_service.predict_batch(frame_dicts)
+    frame_dicts = [frame_to_dict(frame) for frame in request.frames]
+    results = []
+    for frame_dict in frame_dicts:
+        inference_started = perf_counter()
+        prediction, confidence, features_dict = await model_service.predict_window(
+            [frame_dict]
+        )
+        inference_latency_ms = (perf_counter() - inference_started) * 1000
+        results.append((prediction, confidence, features_dict, inference_latency_ms))
 
     detection_results = []
     attack_count = 0
-    for i, ((prediction, confidence), frame) in enumerate(zip(results, request.frames)):
+    for i, (result, frame) in enumerate(zip(results, request.frames)):
+        prediction, confidence, features_dict, inference_latency_ms = result
         if prediction != "Normal":
             attack_count += 1
             await audit_service.log_event(
@@ -118,10 +130,6 @@ async def detect_batch(
                     "batch_index": i,
                 },
             )
-        # Extract window-level features for each frame
-        _, _, features_dict = await model_service.predict_window(
-            [frame_to_dict(frame)]
-        )
         detection_results.append(DetectionResult(
             prediction=prediction,
             confidence=confidence,
@@ -129,6 +137,7 @@ async def detect_batch(
             model_version=model_service.model_version,
             timestamp=datetime.now(timezone.utc),
             vehicle_token=request.vehicle_token,
+            inference_latency_ms=inference_latency_ms,
         ))
 
     summary = {"total": len(detection_results), "attacks": attack_count, "normal": len(detection_results) - attack_count}
