@@ -27,7 +27,7 @@ logger = logging.getLogger("vsoc.auth")
 
 DEMO_MODE = os.getenv("DEMO_MODE", "false").lower() in ("1", "true", "yes")
 AUTH_SECRET = os.getenv("AUTH_SECRET", "")
-TOKEN_SECRET = os.getenv("TOKEN_SECRET", "change-me-token-secret")
+TOKEN_SECRET = os.getenv("TOKEN_SECRET", "")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "60"))
 
@@ -50,6 +50,12 @@ def validate_startup_config() -> None:
             "DEMO_MODE is enabled. Unsafe defaults and unauthenticated bearer "
             "tokens are permitted for demonstration only."
         )
+        # Still reject known unsafe defaults even in demo mode
+        if not TOKEN_SECRET or _is_unsafe_default(TOKEN_SECRET):
+            logger.warning(
+                "TOKEN_SECRET is missing or uses an unsafe default; "
+                "set a strong TOKEN_SECRET before production deployment."
+            )
         return
 
     if not AUTH_SECRET or _is_unsafe_default(AUTH_SECRET):
@@ -58,7 +64,7 @@ def validate_startup_config() -> None:
             "Do not use the development default."
         )
 
-    if _is_unsafe_default(TOKEN_SECRET):
+    if not TOKEN_SECRET or _is_unsafe_default(TOKEN_SECRET):
         raise RuntimeError(
             "TOKEN_SECRET must be set to a strong value outside demo mode. "
             "Do not use the development default 'change-me-token-secret'."

@@ -19,10 +19,22 @@ from typing import Optional, Tuple
 logger = logging.getLogger("vsoc.tokenization")
 
 TOKEN_ROTATION_INTERVAL_HOURS = int(os.getenv("TOKEN_ROTATION_INTERVAL_HOURS", "24"))
-TOKEN_SECRET = os.getenv("TOKEN_SECRET", "change-me-token-secret")
+TOKEN_SECRET = os.getenv("TOKEN_SECRET", "")
 
 # Known unsafe defaults
 _UNSAFE_DEFAULTS = {"change-me-token-secret", "change-me", "secret", "development"}
+
+# Restricted token-to-identity vault (Phase 2: token creation → vault registration)
+# Maps token string -> vehicle_id. Only accessible via get_vehicle_from_token()
+# which enforces vault:read permission. Populated by generate_token().
+_token_vault: dict = {}
+_token_vault_lock = None  # type: ignore
+try:
+    from threading import RLock
+
+    _token_vault_lock = RLock()
+except ImportError:
+    _token_vault_lock = None
 
 
 def _is_unsafe_default(secret: str) -> bool:
@@ -51,6 +63,11 @@ def generate_token(vehicle_id: str, context: Optional[str] = None) -> Tuple[str,
 
     Returns (token, rotation_epoch, expires_at).
     """
+    if not TOKEN_SECRET or _is_unsafe_default(TOKEN_SECRET):
+        raise RuntimeError(
+            "TOKEN_SECRET must be set to a strong value before generating tokens. "
+            "Do not use the development default."
+        )
     epoch = _current_rotation_epoch()
     key = _key_for_epoch(epoch)
 
@@ -69,7 +86,48 @@ def generate_token(vehicle_id: str, context: Optional[str] = None) -> Tuple[str,
     expires_at = epoch_start + timedelta(hours=current_epoch_start_hour + TOKEN_ROTATION_INTERVAL_HOURS)
 
     logger.info("Generated token for vehicle (epoch=%d)", epoch)
+
+    # Register token→vehicle_id mapping in the restricted vault (Phase 2)
+    if _token_vault_lock is not None:
+        with _token_vault_lock:
+            _token_vault[token] = vehicle_id
+    else:
+        _token_vault[token] = vehicle_id
+
     return token, epoch, expires_at
+
+
+def register_token_mapping(token: str, vehicle_id: str) -> None:
+    """Manually register a token→vehicle_id mapping in the restricted vault.
+
+    Used during trusted provisioning or when tokens are created outside
+    generate_token(). Enforces that the mapping is stored in the isolated vault.
+    """
+    if not token or not vehicle_id:
+        raise ValueError("token and vehicle_id must not be empty")
+    if _token_vault_lock is not None:
+        with _token_vault_lock:
+            _token_vault[token] = vehicle_id
+    else:
+        _token_vault[token] = vehicle_id
+
+
+def get_vehicle_from_token(token: str, requesting_user=None) -> Optional[str]:
+    """Look up a vehicle_id from a token in the restricted vault.
+
+    Phase 2: Vault access is restricted. If requesting_user is provided,
+    it must have vault:read permission. Analysts and auditors are denied.
+    """
+    if requesting_user is not None:
+        from backend.services.access_control import access_control
+
+        if not access_control.require_permission(requesting_user, "vault:read"):
+            return None
+
+    if _token_vault_lock is not None:
+        with _token_vault_lock:
+            return _token_vault.get(token)
+    return _token_vault.get(token)
 
 
 def verify_token(token: str, vehicle_id: str, epoch: int) -> bool:

@@ -1,7 +1,6 @@
 """API smoke tests and authentication/dual-approval regression tests."""
 
 import backend.auth as backend_auth
-
 from fastapi.testclient import TestClient
 
 from backend.main import app
@@ -28,34 +27,40 @@ def test_root_endpoint():
 
 
 def _configure_demo_auth(monkeypatch):
-    """Configure synthetic demo credentials and isolate audit writes."""
-    tokens = {
-        "ZEROSIGHT_DEMO_AUTH": "true",
-        "ZEROSIGHT_ANALYST_TOKEN": "analyst-demo-token-" + "a" * 40,
-        "ZEROSIGHT_SECURITY_OFFICER_1_TOKEN": (
-            "officer-one-demo-token-" + "b" * 40
-        ),
-        "ZEROSIGHT_SECURITY_OFFICER_2_TOKEN": (
-            "officer-two-demo-token-" + "c" * 40
-        ),
-        "ZEROSIGHT_SECURITY_OFFICER_3_TOKEN": (
-            "officer-three-demo-token-" + "d" * 40
-        ),
-        "ZEROSIGHT_AUDITOR_TOKEN": "auditor-demo-token-" + "e" * 40,
-        "ZEROSIGHT_ADMIN_TOKEN": "admin-demo-token-" + "f" * 40,
-    }
+    """Configure demo-mode authentication and isolate audit writes."""
+    monkeypatch.setenv("DEMO_MODE", "true")
+    monkeypatch.setenv(
+        "AUTH_SECRET",
+        "strong-test-secret-0123456789abcdef",
+    )
+    monkeypatch.setenv(
+        "TOKEN_SECRET",
+        "strong-test-secret-0123456789abcdef",
+    )
 
-    for name, value in tokens.items():
-        monkeypatch.setenv(name, value)
+    # DEMO_MODE is read at module import time, so set it directly as well.
+    monkeypatch.setattr(backend_auth, "DEMO_MODE", True)
 
     async def no_op_audit_event(*args, **kwargs):
         """Prevent tests from depending on SQLite initialization."""
         return None
 
-    # Keep API tests independent from SQLite initialization and filesystem state.
     monkeypatch.setattr(audit_service, "log_event", no_op_audit_event)
 
-    return tokens
+    # Synthetic identities and roles used by the demo authentication flow.
+    return {
+        "analyst": ("analyst_1", "analyst"),
+        "security_officer_1": ("sec_officer_1", "security_officer"),
+        "security_officer_2": ("sec_officer_2", "security_officer"),
+        "security_officer_3": ("sec_officer_3", "security_officer"),
+        "auditor": ("auditor_1", "auditor"),
+        "admin": ("admin_1", "admin"),
+    }
+
+
+def _bearer(user_id: str, roles: str) -> str:
+    """Build a demo-mode bearer authorization header."""
+    return f"Bearer {user_id}:{roles}"
 
 
 def test_privacy_route_rejects_missing_bearer_token(monkeypatch):
@@ -75,12 +80,13 @@ def test_privacy_route_rejects_missing_bearer_token(monkeypatch):
 
 def test_analyst_cannot_spoof_security_officer_in_request_body(monkeypatch):
     tokens = _configure_demo_auth(monkeypatch)
+    analyst_id, analyst_roles = tokens["analyst"]
     client = TestClient(app)
 
     response = client.post(
         "/privacy/unmask/request",
         headers={
-            "Authorization": f"Bearer {tokens['ZEROSIGHT_ANALYST_TOKEN']}"
+            "Authorization": _bearer(analyst_id, analyst_roles),
         },
         json={
             "vehicle_token": "token-demo",
@@ -89,7 +95,8 @@ def test_analyst_cannot_spoof_security_officer_in_request_body(monkeypatch):
         },
     )
 
-    assert response.status_code == 403
+    # Analysts lack permission to request identity unmasking.
+    assert response.status_code == 403, response.text
 
 
 def test_api_dual_approval_uses_authenticated_principals_and_discloses_once(
@@ -113,13 +120,15 @@ def test_api_dual_approval_uses_authenticated_principals_and_discloses_once(
 
     client = TestClient(app)
 
-    # The authenticated principal should determine the requester identity.
+    officer1_id, officer1_roles = tokens["security_officer_1"]
+    officer2_id, officer2_roles = tokens["security_officer_2"]
+    officer3_id, officer3_roles = tokens["security_officer_3"]
+
+    # The authenticated principal must determine the requester identity.
     create_response = client.post(
         "/privacy/unmask/request",
         headers={
-            "Authorization": (
-                f"Bearer {tokens['ZEROSIGHT_SECURITY_OFFICER_1_TOKEN']}"
-            )
+            "Authorization": _bearer(officer1_id, officer1_roles),
         },
         json={
             "vehicle_token": "token-demo",
@@ -134,16 +143,14 @@ def test_api_dual_approval_uses_authenticated_principals_and_discloses_once(
 
     assert (
         privacy_routes.unmask_service.get_request(request_id).requested_by
-        == "sec_officer_1"
+        == officer1_id
     )
 
-    # The first distinct security officer approves the request.
+    # The first security officer approves the request.
     first = client.post(
         "/privacy/unmask/approve",
         headers={
-            "Authorization": (
-                f"Bearer {tokens['ZEROSIGHT_SECURITY_OFFICER_2_TOKEN']}"
-            )
+            "Authorization": _bearer(officer2_id, officer2_roles),
         },
         json={
             "request_id": request_id,
@@ -155,13 +162,11 @@ def test_api_dual_approval_uses_authenticated_principals_and_discloses_once(
     assert first.status_code == 200, first.text
     assert first.json()["status"] == "requested"
 
-    # The same officer must not approve the request twice.
+    # The same officer cannot approve the same request twice.
     duplicate = client.post(
         "/privacy/unmask/approve",
         headers={
-            "Authorization": (
-                f"Bearer {tokens['ZEROSIGHT_SECURITY_OFFICER_2_TOKEN']}"
-            )
+            "Authorization": _bearer(officer2_id, officer2_roles),
         },
         json={
             "request_id": request_id,
@@ -175,9 +180,7 @@ def test_api_dual_approval_uses_authenticated_principals_and_discloses_once(
     second = client.post(
         "/privacy/unmask/approve",
         headers={
-            "Authorization": (
-                f"Bearer {tokens['ZEROSIGHT_SECURITY_OFFICER_3_TOKEN']}"
-            )
+            "Authorization": _bearer(officer3_id, officer3_roles),
         },
         json={
             "request_id": request_id,
@@ -190,26 +193,28 @@ def test_api_dual_approval_uses_authenticated_principals_and_discloses_once(
     assert second.json()["status"] == "completed"
     assert second.json()["real_identity"] == "SYNTHETIC-VIN-001"
 
-    # The completed request must not disclose the identity a second time.
+    # The completed request cannot disclose the identity again.
     assert (
         privacy_routes.unmask_service.unmask(
             request_id,
-            disclosed_by="sec_officer_3",
+            disclosed_by=officer1_id,
         )
         is None
     )
 
 
 def test_access_me_resolves_async_auth_dependency(monkeypatch):
-    """Verify the asynchronous dependency resolves to an authenticated user."""
-    monkeypatch.setattr(backend_auth, "DEMO_MODE", True)
-
+    """Verify the async authentication dependency returns a valid user."""
+    _configure_demo_auth(monkeypatch)
     client = TestClient(app)
 
     response = client.get(
         "/access/me",
         headers={
-            "Authorization": "Bearer dependency-test-analyst:analyst"
+            "Authorization": _bearer(
+                "dependency-test-analyst",
+                "analyst",
+            ),
         },
     )
 
@@ -223,28 +228,31 @@ def test_access_me_resolves_async_auth_dependency(monkeypatch):
 
 
 def test_access_roles_enforces_permissions(monkeypatch):
-    """Verify only users with access:roles permission can list roles."""
-    # Configure audit logging for tests and prevent writes to an uninitialized DB.
+    """Verify the roles endpoint enforces role-based permissions."""
     _configure_demo_auth(monkeypatch)
-    monkeypatch.setattr(backend_auth, "DEMO_MODE", True)
-
     client = TestClient(app)
 
-    # Analysts do not have the access:roles permission.
+    # An analyst lacks the access:roles permission.
     denied = client.get(
         "/access/roles",
         headers={
-            "Authorization": "Bearer dependency-test-analyst:analyst"
+            "Authorization": _bearer(
+                "dependency-test-analyst",
+                "analyst",
+            ),
         },
     )
 
     assert denied.status_code == 403, denied.text
 
-    # Auditors have the access:roles permission.
+    # An auditor has the access:roles permission.
     allowed = client.get(
         "/access/roles",
         headers={
-            "Authorization": "Bearer dependency-test-auditor:auditor"
+            "Authorization": _bearer(
+                "dependency-test-auditor",
+                "auditor",
+            ),
         },
     )
 

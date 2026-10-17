@@ -54,7 +54,7 @@ async def generic_approve(
             detail="Only security officers can approve",
         )
     await audit_service.log_event(
-        event_type="access_denied" if not decision.approve else "attack_alert",
+        event_type="access_approve" if decision.approve else "access_deny",
         actor=current_user.user_id,
         outcome="success",
         details={"action": "generic_approve", "request_id": decision.request_id, "approve": decision.approve},
