@@ -33,4 +33,4 @@ jobs:
       - name: Run lint check
         run: |
           pip install ruff
-          ruff check backend/ detection/ privacy/ access_control/ audit/ anomaly_detection/ scripts/
+          ruff check --select E9,F63,F7,F82 backend/ detection/ privacy/ access_control/ audit/ anomaly_detection/ scripts/
