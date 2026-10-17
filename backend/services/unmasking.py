@@ -142,6 +142,15 @@ class UnmaskingService:
     def _expire_if_needed(self, record: UnmaskRequestRecord) -> None:
         if record.status == REQUESTED and record.is_expired():
             record.status = EXPIRED
+            # Phase 2: Automatic re-masking — remove identity from vault on expiry
+            # so the real identity cannot be disclosed after the request expires.
+            identity = self._identity_map.pop(record.vehicle_token, None)
+            if identity is not None:
+                logger.info(
+                    "Re-masked identity for token %s after request %s expired",
+                    record.vehicle_token,
+                    record.request_id,
+                )
 
     def get_request(self, request_id: str) -> Optional[UnmaskRequestRecord]:
         with self._lock:
@@ -183,7 +192,10 @@ class UnmaskingService:
             return record.reject(approver.user_id)
 
     def unmask(self, request_id: str, disclosed_by: str) -> Optional[str]:
-        """Return identity once, only to the authorized approver completing the request."""
+        """Return identity once, only to the authorized approver completing the request.
+
+        Phase 2: Requires vault:read permission on the disclosed_by user.
+        """
         with self._lock:
             record = self._requests.get(request_id)
             approver = self.access_control.get_user(disclosed_by)
@@ -195,6 +207,7 @@ class UnmaskingService:
                 or approver is None
                 or not approver.has_role("security_officer")
                 or not approver.has_permission("privacy:unmask_approve")
+                or not approver.has_permission("vault:read")
             ):
                 return None
 
@@ -204,6 +217,22 @@ class UnmaskingService:
             record.identity_revealed_at = datetime.now(timezone.utc)
             logger.info("Identity disclosure completed for request %s", record.request_id)
             return identity
+
+    def re_mask_token(self, vehicle_token: str, requesting_user=None) -> bool:
+        """Explicitly re-mask a vehicle token by removing its identity from the vault.
+
+        Phase 2: Requires vault:write permission on the requesting_user.
+        Returns True if an identity was removed, False if none existed.
+        """
+        if requesting_user is not None:
+            if not requesting_user.has_permission("vault:write"):
+                return False
+        with self._lock:
+            identity = self._identity_map.pop(vehicle_token, None)
+            if identity is not None:
+                logger.info("Re-masked identity for token %s on explicit request", vehicle_token)
+                return True
+            return False
 
     def list_requests(self) -> List[UnmaskRequestRecord]:
         with self._lock:

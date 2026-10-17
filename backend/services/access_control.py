@@ -23,6 +23,8 @@ ROLE_PERMISSIONS: Dict[str, Set[str]] = {
         "privacy:unmask_request",
         "privacy:unmask_approve",
         "audit:read_own",
+        "vault:read",
+        "vault:write",
     },
     "auditor": {
         "audit:read",
@@ -35,7 +37,7 @@ ROLE_PERMISSIONS: Dict[str, Set[str]] = {
 
 ROLE_DESCRIPTIONS: Dict[str, str] = {
     "analyst": "Security analyst - detection and alert review",
-    "security_officer": "Security officer - unmask approval authority",
+    "security_officer": "Security officer - unmask approval authority and identity vault access",
     "auditor": "Auditor - audit and compliance review",
     "admin": "Administrator - break-glass emergency access",
 }

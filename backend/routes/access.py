@@ -13,7 +13,7 @@ router = APIRouter()
 
 @router.get("/roles", response_model=List[RoleInfo])
 async def list_roles(
-    current_user: UserContext = Depends(lambda: get_current_user()),
+    current_user: UserContext = Depends(get_current_user),
 ):
     """List available roles and their permissions."""
     if not access_control.require_permission(current_user, "access:roles"):
@@ -26,7 +26,7 @@ async def list_roles(
 
 @router.get("/me", response_model=CurrentUser)
 async def get_current_user_info(
-    current_user: UserContext = Depends(lambda: get_current_user()),
+    current_user: UserContext = Depends(get_current_user),
 ):
     """Get the current user's context."""
     return CurrentUser(
@@ -39,7 +39,7 @@ async def get_current_user_info(
 @router.post("/approve")
 async def generic_approve(
     decision: ApprovalDecision,
-    current_user: UserContext = Depends(lambda: get_current_user()),
+    current_user: UserContext = Depends(get_current_user),
 ):
     """Generic approval endpoint for access control decisions."""
     if not access_control.require_role(current_user, "security_officer"):
@@ -54,7 +54,7 @@ async def generic_approve(
             detail="Only security officers can approve",
         )
     await audit_service.log_event(
-        event_type="access_denied" if not decision.approve else "attack_alert",
+        event_type="access_approve" if decision.approve else "access_deny",
         actor=current_user.user_id,
         outcome="success",
         details={"action": "generic_approve", "request_id": decision.request_id, "approve": decision.approve},

@@ -6,6 +6,7 @@ Starts model loading and audit service on application lifespan.
 
 import os
 import logging
+import platform
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -23,39 +24,51 @@ logging.basicConfig(
 )
 logger = logging.getLogger("vsoc")
 
-# Global service instances (initialized in lifespan, imported as singletons)
-# model_service, audit_service, access_control are imported above as module-level singletons
+# Module-level service singletons (initialized in lifespan; never reassigned)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Initialize services on startup, cleanup on shutdown."""
-    global model_service, audit_service, access_control
-
     logger.info("Starting privacy-native vSOC backend...")
+
+    # Log target-platform evidence (Phase 4: LinuxONE verification)
+    try:
+        mem_bytes = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+        mem_gb = round(mem_bytes / (1024 ** 3), 2)
+    except (AttributeError, OSError):
+        mem_gb = None
+    logger.info(
+        "Platform: %s %s | arch=%s | python=%s | mem_gb=%s | cpus=%s",
+        platform.system(),
+        platform.release(),
+        platform.machine(),
+        platform.python_version(),
+        mem_gb,
+        os.cpu_count(),
+    )
 
     # Validate security-critical configuration before initializing services
     validate_startup_config()
 
-    # Initialize audit service (hash-chained SQLite log)
+    # Initialize audit service (hash-chained SQLite log) — mutate singleton, never reassign
     audit_db_path = os.getenv("AUDIT_DB_PATH", "./data/audit.db")
-    # Rebind with correct db_path if different from default
-    if audit_db_path != "./data/audit.db":
-        audit_service = AuditService(db_path=audit_db_path)
+    audit_service.db_path = audit_db_path
     await audit_service.initialize()
     logger.info("Audit service initialized at %s", audit_db_path)
 
-    # Initialize access control
-    access_control = AccessControlService()
+    # Initialize access control — mutate singleton, never reassign
+    access_control._users.clear()
+    access_control.__init__()
     logger.info("Access control service initialized")
 
-    # Initialize model service (load trained model or train baseline)
+    # Initialize model service (load trained model or fail safely — no dummy fallback)
     model_dir = os.getenv("MODEL_DIR", "./models")
     dataset_dir = os.getenv("DATASET_DIR", "./data/raw")
-    if model_dir != "./models" or dataset_dir != "./data/raw":
-        model_service = ModelService(model_dir=model_dir, dataset_dir=dataset_dir)
+    model_service.model_dir = Path(model_dir)
+    model_service.dataset_dir = Path(dataset_dir)
     await model_service.initialize()
-    logger.info("Model service initialized")
+    logger.info("Model service initialized (model_loaded=%s)", model_service.is_loaded())
 
     # Log startup event
     await audit_service.log_event(
@@ -86,13 +99,22 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# CORS (restrict in production)
+# CORS — explicit allowlist; no wildcard origins in production
+_cors_origins = os.getenv(
+    "CORS_ALLOW_ORIGINS",
+    "http://localhost:8501,http://127.0.0.1:8501",
+)
+_allow_credentials = os.getenv("CORS_ALLOW_CREDENTIALS", "true").lower() in (
+    "1",
+    "true",
+    "yes",
+)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=[o.strip() for o in _cors_origins.split(",") if o.strip()],
+    allow_credentials=_allow_credentials,
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "Accept"],
 )
 
 
