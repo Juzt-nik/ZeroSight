@@ -1,8 +1,9 @@
-"""Schemas for privacy module."""
+"""Pydantic schemas for privacy-related API routes."""
+
+from datetime import datetime
+from typing import Optional
 
 from pydantic import BaseModel, Field
-from typing import Optional
-from datetime import datetime
 
 
 class TokenizeRequest(BaseModel):
@@ -35,9 +36,9 @@ class LocationCoarsenResponse(BaseModel):
 
 
 class UnmaskRequest(BaseModel):
+    # The requester identity comes from the authenticated principal, never the JSON body.
     vehicle_token: str = Field(..., description="Pseudonymous token to unmask")
     justification: str = Field(..., min_length=10, description="Business justification")
-    requested_by: str = Field(..., description="User requesting unmask")
 
 
 class UnmaskResponse(BaseModel):
@@ -45,12 +46,12 @@ class UnmaskResponse(BaseModel):
     status: str = Field(..., description="requested | approved | rejected | completed | expired")
     vehicle_token: str
     real_identity: Optional[str] = None
-    approved_by: list[str] = []
+    approved_by: list[str] = Field(default_factory=list)
     created_at: datetime
     expires_at: datetime
 
 
 class UnmaskApproveRequest(BaseModel):
     request_id: str
-    approver_user_id: str
+    # The approver identity comes from the authenticated principal, never the JSON body.
     approve: bool = Field(..., description="true to approve, false to reject")
