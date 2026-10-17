@@ -12,14 +12,11 @@ from backend.services.location import coarsen_location
 from backend.services.unmasking import UnmaskingService
 from backend.services.audit_service import audit_service
 from backend.services.access_control import access_control, UserContext
+from backend.auth import get_current_user
 
 router = APIRouter()
 
 unmask_service = UnmaskingService()
-
-
-def get_current_user() -> UserContext:
-    return access_control.get_user("analyst_1") or UserContext(user_id="demo", roles={"analyst"})
 
 
 @router.post("/tokenize", response_model=TokenizeResponse)
@@ -34,10 +31,10 @@ async def tokenize_vehicle(
         )
     token, epoch, expires_at = generate_token(request.vehicle_id, request.context)
     await audit_service.log_event(
-        event_type="attack_alert",
+        event_type="tokenization",
         actor=current_user.user_id,
         outcome="success",
-        details={"action": "tokenize", "vehicle_token": token},
+        details={"action": "tokenize", "vehicle_token": token, "rotation_epoch": epoch},
     )
     return TokenizeResponse(vehicle_token=token, rotation_epoch=epoch, expires_at=expires_at)
 
@@ -57,10 +54,10 @@ async def coarsen_location_endpoint(
         minimization_level=request.minimization_level,
     )
     await audit_service.log_event(
-        event_type="attack_alert",
+        event_type="location_minimized",
         actor=current_user.user_id,
         outcome="success",
-        details={"action": "location_coarsen", "level": result["minimization_applied"]},
+        details={"action": "location_coarsen", "level": result["minimization_applied"], "grid_cell": result.get("grid_cell")},
     )
     return LocationCoarsenResponse(**result)
 
@@ -144,10 +141,10 @@ async def approve_unmask(
     if updated.status == "completed":
         real_identity = unmask_service.unmask(request.request_id)
         await audit_service.log_event(
-            event_type="unmask_complete",
+            event_type="identity_released",
             actor=current_user.user_id,
             outcome="success",
-            details={"request_id": request.request_id},
+            details={"request_id": request.request_id, "vehicle_token": updated.vehicle_token},
         )
         return {
             "request_id": request.request_id,

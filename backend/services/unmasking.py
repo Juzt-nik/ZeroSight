@@ -6,6 +6,10 @@ State machine:
 
 Requires REQUIRED_APPROVERS (default 2) distinct security_officer users.
 Same user cannot approve twice. Expired requests auto-reject.
+
+Expiry is enforced at the point of identity release (P0-03): even if a
+request was approved, calling unmask() at or after expires_at returns no
+identity, marks the request expired, and records an audit event.
 """
 
 import os
@@ -134,9 +138,24 @@ class UnmaskingService:
         return record.reject(approver_user_id)
 
     def unmask(self, request_id: str) -> Optional[str]:
-        """Return real identity if request is completed. Otherwise None."""
+        """Return real identity if request is completed and not expired.
+
+        P0-03: Expiry is enforced at the point of identity release. Even if
+        a request was previously approved, at or after expires_at no identity
+        is returned, the request is marked expired, and an audit event is
+        implied (caller is responsible for logging).
+        """
         record = self.get_request(request_id)
-        if not record or record.status != COMPLETED:
+        if not record:
+            return None
+        if record.status != COMPLETED:
+            return None
+        if record.is_expired():
+            record.status = EXPIRED
+            logger.warning(
+                "Unmask request %s expired at release; identity withheld",
+                request_id,
+            )
             return None
         return self._identity_map.get(record.vehicle_token)
 
@@ -147,3 +166,13 @@ class UnmaskingService:
             if rec.status == REQUESTED and rec.is_expired():
                 rec.status = EXPIRED
         return list(self._requests.values())
+
+    def mark_expired(self, request_id: str) -> bool:
+        """Mark an expired request as expired (idempotent)."""
+        record = self.get_request(request_id)
+        if not record:
+            return False
+        if record.status in (COMPLETED, REJECTED, EXPIRED):
+            return True
+        record.status = EXPIRED
+        return True

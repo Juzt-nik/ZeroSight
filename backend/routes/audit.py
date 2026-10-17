@@ -6,12 +6,9 @@ from typing import Optional
 from backend.schemas.audit import AuditQuery, VerifyResult
 from backend.services.audit_service import audit_service
 from backend.services.access_control import access_control, UserContext
+from backend.auth import get_current_user
 
 router = APIRouter()
-
-
-def get_current_user() -> UserContext:
-    return access_control.get_user("auditor_1") or UserContext(user_id="demo", roles={"auditor"})
 
 
 @router.get("/events")
@@ -67,6 +64,48 @@ async def verify_audit_chain(
         },
     )
 
+    return result
+
+
+@router.get("/checkpoints")
+async def get_audit_checkpoints(
+    current_user: UserContext = Depends(lambda: get_current_user()),
+):
+    """List all signed audit checkpoints (auditor only)."""
+    if not access_control.require_permission(current_user, "audit:read"):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Insufficient permissions to view checkpoints",
+        )
+    checkpoints = audit_service._conn.execute(
+        "SELECT sequence, hash, signature, key_id, created_at FROM audit_checkpoints ORDER BY sequence ASC"
+    ).fetchall()
+    return {
+        "total": len(checkpoints),
+        "checkpoints": [
+            {
+                "sequence": r[0],
+                "hash": r[1],
+                "signature": r[2],
+                "key_id": r[3],
+                "created_at": r[4],
+            }
+            for r in checkpoints
+        ],
+    }
+
+
+@router.get("/checkpoints/verify")
+async def verify_audit_checkpoints(
+    current_user: UserContext = Depends(lambda: get_current_user()),
+):
+    """Verify all signed audit checkpoint signatures (auditor only)."""
+    if not access_control.require_permission(current_user, "audit:verify"):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Insufficient permissions to verify checkpoints",
+        )
+    result = audit_service.verify_checkpoints()
     return result
 
 

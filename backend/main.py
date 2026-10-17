@@ -11,6 +11,7 @@ from fastapi import FastAPI, Request, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
+from backend.auth import validate_startup_config, get_current_user
 from backend.routes import detection, privacy, access, audit, anomaly
 from backend.services.model_service import model_service, ModelService
 from backend.services.audit_service import audit_service, AuditService
@@ -32,6 +33,9 @@ async def lifespan(app: FastAPI):
     global model_service, audit_service, access_control
 
     logger.info("Starting privacy-native vSOC backend...")
+
+    # Validate security-critical configuration before initializing services
+    validate_startup_config()
 
     # Initialize audit service (hash-chained SQLite log)
     audit_db_path = os.getenv("AUDIT_DB_PATH", "./data/audit.db")

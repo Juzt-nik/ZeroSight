@@ -37,7 +37,6 @@ class LocationCoarsenResponse(BaseModel):
 class UnmaskRequest(BaseModel):
     vehicle_token: str = Field(..., description="Pseudonymous token to unmask")
     justification: str = Field(..., min_length=10, description="Business justification")
-    requested_by: str = Field(..., description="User requesting unmask")
 
 
 class UnmaskResponse(BaseModel):
@@ -52,5 +51,5 @@ class UnmaskResponse(BaseModel):
 
 class UnmaskApproveRequest(BaseModel):
     request_id: str
-    approver_user_id: str
     approve: bool = Field(..., description="true to approve, false to reject")
+    reason: Optional[str] = None

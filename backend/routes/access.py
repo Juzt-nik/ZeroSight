@@ -6,12 +6,9 @@ from typing import List
 from backend.schemas.access import RoleInfo, CurrentUser, ApprovalRequest, ApprovalDecision
 from backend.services.access_control import access_control, UserContext, default_access_control
 from backend.services.audit_service import audit_service
+from backend.auth import get_current_user
 
 router = APIRouter()
-
-
-def get_current_user() -> UserContext:
-    return access_control.get_user("analyst_1") or UserContext(user_id="demo", roles={"analyst"})
 
 
 @router.get("/roles", response_model=List[RoleInfo])

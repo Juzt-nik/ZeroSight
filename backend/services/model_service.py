@@ -1,38 +1,48 @@
-"""ML model service: loads or trains a baseline detector and provides inference."""
+"""ML model service: loads or trains a baseline detector and provides inference.
+
+P0-05: Uses a shared window-level feature extractor (detection/features.py)
+for both training and inference, guaranteeing feature parity between
+training and serving. Model metadata records dataset, feature version,
+split strategy, and model version for reproducibility.
+"""
 
 import os
 import json
 import logging
 import asyncio
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional, Tuple, Dict, Any, List
 
 import joblib
 import numpy as np
 import pandas as pd
-from sklearn.ensemble import RandomForestClassifier
+from sklearn.ensemble import RandomForestClassifier, IsolationForest
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import (
     accuracy_score, precision_score, recall_score, f1_score,
     confusion_matrix, classification_report
 )
 
+from detection.features import (
+    WindowFeatureExtractor,
+    FEATURE_VERSION as FEATURE_VERSION_STR,
+)
+
 logger = logging.getLogger("vsoc.model_service")
 
-FEATURE_COLUMNS = [
-    "timestamp_delta_ms",
-    "dlc",
-    "byte_entropy",
-    "can_id_freq",
-    "data_byte_mean",
-    "data_byte_std",
-    "data_byte_min",
-    "data_byte_max",
-    "is_multi_byte",
+CLASS_LABELS = ["Normal", "DoS", "Fuzzy", "Gear", "RPM"]
+
+# Model metadata for provenance (P1-03, P1-04)
+MODEL_METADATA_KEYS = [
+    "dataset_version", "feature_version", "split_strategy",
+    "model_version", "training_samples", "test_samples",
+    "window_ms", "trained_at",
 ]
 
-CLASS_LABELS = ["Normal", "DoS", "Fuzzy", "Gear", "RPM"]
+# P1-03: Ensemble configuration
+USE_ENSEMBLE = os.getenv("USE_ENSEMBLE", "false").lower() in ("1", "true", "yes")
+ISOLATION_FOREST_CONTAMINATION = float(os.getenv("ISOLATION_FOREST_CONTAMINATION", "0.1"))
 
 
 class ModelService:
@@ -40,10 +50,15 @@ class ModelService:
         self.model_dir = Path(model_dir)
         self.dataset_dir = Path(dataset_dir)
         self.model: Optional[RandomForestClassifier] = None
-        self.model_version: str = "0.1.0-baseline"
+        self.isolation_forest: Optional[IsolationForest] = None
+        self.model_version: str = "0.1.0-window"
         self.is_trained: bool = False
         self.metrics: Optional[Dict[str, Any]] = None
         self._lock = asyncio.Lock()
+        self.window_ms: float = 100.0
+        self.feature_extractor: Optional[WindowFeatureExtractor] = None
+        self.model_metadata: Dict[str, Any] = {}
+        self.use_ensemble: bool = USE_ENSEMBLE
 
     def is_loaded(self) -> bool:
         return self.model is not None
@@ -51,15 +66,29 @@ class ModelService:
     async def initialize(self):
         self.model_dir.mkdir(parents=True, exist_ok=True)
         model_path = self.model_dir / "baseline_rf.pkl"
+        if_path = self.model_dir / "isolation_forest.pkl"
         metrics_path = self.model_dir / "metrics.json"
+        metadata_path = self.model_dir / "metadata.json"
+
+        # Initialize feature extractor
+        self.feature_extractor = WindowFeatureExtractor(window_ms=self.window_ms)
 
         if model_path.exists():
             try:
                 self.model = joblib.load(model_path)
                 self.is_trained = True
+                if self.use_ensemble and if_path.exists():
+                    try:
+                        self.isolation_forest = joblib.load(if_path)
+                        logger.info("Loaded Isolation Forest from %s", if_path)
+                    except Exception as exc:
+                        logger.warning("Failed to load Isolation Forest: %s", exc)
                 if metrics_path.exists():
                     with open(metrics_path) as f:
                         self.metrics = json.load(f)
+                if metadata_path.exists():
+                    with open(metadata_path) as f:
+                        self.model_metadata = json.load(f)
                 logger.info("Loaded existing model from %s", model_path)
                 return
             except Exception as exc:
@@ -95,7 +124,8 @@ class ModelService:
         if not frames:
             logger.warning("No dataset files found; creating untrained placeholder model")
             self.model = RandomForestClassifier(n_estimators=10, random_state=42)
-            X_dummy = np.zeros((1, len(FEATURE_COLUMNS)))
+            feature_names = self.feature_extractor.feature_names()
+            X_dummy = np.zeros((1, len(feature_names)))
             y_dummy = np.array(["Normal"])
             self.model.fit(X_dummy, y_dummy)
             self.is_trained = True
@@ -111,16 +141,33 @@ class ModelService:
                 "test_samples": 0,
                 "note": "No dataset found - placeholder model",
             }
+            self.model_metadata = {
+                "dataset_version": "none",
+                "feature_version": FEATURE_VERSION_STR,
+                "split_strategy": "none",
+                "model_version": self.model_version,
+                "training_samples": 0,
+                "test_samples": 0,
+                "window_ms": self.window_ms,
+                "trained_at": datetime.now(timezone.utc).isoformat(),
+                "placeholder": True,
+            }
             return
 
         data = pd.concat(frames, ignore_index=True)
         logger.info("Total dataset: %d rows", len(data))
 
-        X = self._engineer_features(data)
-        y = data["label"].values
+        # Engineer window-level features using shared extractor (P0-05)
+        X, y, feature_names = self._engineer_features(data)
 
-        X_train, X_test, y_train, y_test = train_test_split(
-            X, y, test_size=0.2, random_state=42, stratify=y
+        # P1-04: Time-based split - contiguous segments, first 80% train, last 20% test
+        split_idx = int(len(X) * 0.8)
+        X_train, X_test = X[:split_idx], X[split_idx:]
+        y_train, y_test = y[:split_idx], y[split_idx:]
+
+        logger.info(
+            "Train: %d samples, Test: %d samples (time-based split)",
+            len(X_train), len(X_test),
         )
 
         model = RandomForestClassifier(
@@ -140,14 +187,51 @@ class ModelService:
         self.is_trained = True
         self.metrics = metrics
 
+        # Save model, metrics, and metadata
         joblib.dump(model, model_path)
         with open(metrics_path, "w") as f:
             json.dump(metrics, f, indent=2)
+
+        self.model_metadata = {
+            "dataset_version": "hcrl_car_hacking_v1",
+            "feature_version": FEATURE_VERSION_STR,
+            "split_strategy": "time_based_80_20",
+            "model_version": self.model_version,
+            "training_samples": int(len(X_train)),
+            "test_samples": int(len(X_test)),
+            "window_ms": self.window_ms,
+            "trained_at": datetime.now(timezone.utc).isoformat(),
+            "placeholder": False,
+            "feature_names": feature_names,
+        }
+        with open(metadata_path, "w") as f:
+            json.dump(self.model_metadata, f, indent=2)
 
         logger.info(
             "Baseline trained: accuracy=%.4f, f1_macro=%.4f",
             metrics["accuracy"], metrics["f1_macro"],
         )
+
+        # P1-03: Train Isolation Forest on normal windows for anomaly detection
+        if self.use_ensemble:
+            normal_mask = y_train == "Normal"
+            if normal_mask.sum() > 0:
+                X_normal = X_train[normal_mask]
+                self.isolation_forest = IsolationForest(
+                    contamination=ISOLATION_FOREST_CONTAMINATION,
+                    random_state=42,
+                    n_jobs=-1,
+                )
+                self.isolation_forest.fit(X_normal)
+                joblib.dump(self.isolation_forest, if_path)
+                logger.info(
+                    "Isolation Forest trained on %d normal windows",
+                    int(normal_mask.sum()),
+                )
+                self.model_metadata["ensemble"] = True
+                self.model_metadata["isolation_forest_contamination"] = ISOLATION_FOREST_CONTAMINATION
+                with open(metadata_path, "w") as f:
+                    json.dump(self.model_metadata, f, indent=2)
 
     def _load_can_csv(self, fpath: Path, label: str) -> pd.DataFrame:
         rows = []
@@ -190,45 +274,65 @@ class ModelService:
                     continue
         return pd.DataFrame(rows)
 
-    def _engineer_features(self, df: pd.DataFrame) -> np.ndarray:
-        features = []
+    def _engineer_features(self, df: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray, List[str]]:
+        """Engineer window-level features from a DataFrame of CAN frames.
+
+        P0-05: Uses WindowFeatureExtractor for shared feature computation.
+        Frames are sorted by timestamp, grouped into windows, and each window
+        produces one feature vector labeled by the majority class in the window.
+        """
+        if self.feature_extractor is None:
+            self.feature_extractor = WindowFeatureExtractor(window_ms=self.window_ms)
+
         df = df.sort_values("timestamp").reset_index(drop=True)
-        id_counts = df["arbitration_id"].value_counts().to_dict()
-        prev_timestamp = None
-        for _, row in df.iterrows():
-            ts = row["timestamp"]
-            delta_ms = 0.0 if prev_timestamp is None else (ts - prev_timestamp) * 1000.0
-            prev_timestamp = ts
-            dlc = int(row["dlc"])
-            data_bytes = row["data_bytes"] if isinstance(row["data_bytes"], list) else []
-            if isinstance(data_bytes, str):
-                try:
-                    data_bytes = [int(b, 16) for b in data_bytes.split()]
-                except Exception:
-                    data_bytes = []
-            if data_bytes:
-                byte_counts = np.bincount(data_bytes, minlength=256)
-                probs = byte_counts / len(data_bytes)
-                probs = probs[probs > 0]
-                byte_entropy = float(-np.sum(probs * np.log2(probs)))
-                data_byte_mean = float(np.mean(data_bytes))
-                data_byte_std = float(np.std(data_bytes))
-                data_byte_min = float(np.min(data_bytes))
-                data_byte_max = float(np.max(data_bytes))
-            else:
-                byte_entropy = 0.0
-                data_byte_mean = 0.0
-                data_byte_std = 0.0
-                data_byte_min = 0.0
-                data_byte_max = 0.0
-            can_id_freq = id_counts.get(row["arbitration_id"], 1)
-            is_multi_byte = 1 if dlc > 1 else 0
-            features.append([
-                delta_ms, float(dlc), byte_entropy, float(can_id_freq),
-                data_byte_mean, data_byte_std, data_byte_min, data_byte_max,
-                float(is_multi_byte),
-            ])
-        return np.array(features, dtype=np.float32)
+
+        # Collect reference CAN IDs from the data
+        ref_ids = set(df["arbitration_id"].unique().tolist())
+        self.feature_extractor.reference_can_ids = ref_ids
+
+        # Determine window boundaries from data
+        if len(df) == 0:
+            empty = np.zeros((1, len(self.feature_extractor.feature_names())))
+            return empty, np.array(["Normal"]), self.feature_extractor.feature_names()
+
+        timestamps_ms = df["timestamp"].values * 1000.0
+        window_start = float(timestamps_ms.min())
+        window_end = float(timestamps_ms.max())
+
+        # Group frames into windows
+        window_features: List[Dict[str, Any]] = []
+        window_labels: List[str] = []
+
+        current_start = window_start
+        while current_start < window_end:
+            current_end = current_start + self.window_ms
+            mask = (timestamps_ms >= current_start) & (timestamps_ms < current_end)
+            window_df = df[mask]
+
+            if len(window_df) > 0:
+                frames_list = window_df.to_dict("records")
+                feats = self.feature_extractor.extract_window(
+                    frames_list, current_start
+                )
+                # Majority label in window
+                labels = window_df["label"].values
+                majority_label = max(set(labels), key=list(labels).count)
+                window_features.append(feats)
+                window_labels.append(majority_label)
+
+            current_start = current_end
+
+        if not window_features:
+            empty = np.zeros((1, len(self.feature_extractor.feature_names())))
+            return empty, np.array(["Normal"]), self.feature_extractor.feature_names()
+
+        feature_names = self.feature_extractor.feature_names()
+        X = np.array([
+            [float(f.get(name, 0.0)) for name in feature_names]
+            for f in window_features
+        ], dtype=np.float32)
+        y = np.array(window_labels)
+        return X, y, feature_names
 
     def _compute_metrics(self, y_true, y_pred, classes) -> Dict[str, Any]:
         acc = accuracy_score(y_true, y_pred)
@@ -264,45 +368,70 @@ class ModelService:
             "test_samples": int(len(y_true) * 0.2),
         }
 
-    def extract_features(self, frame_dict: Dict[str, Any]) -> np.ndarray:
-        dlc = frame_dict.get("dlc", 0)
-        data_bytes = frame_dict.get("data_bytes", [])
-        if isinstance(data_bytes, str):
-            try:
-                data_bytes = [int(b, 16) for b in data_bytes.split()]
-            except Exception:
-                data_bytes = []
-        if data_bytes:
-            byte_counts = np.bincount(data_bytes, minlength=256)
-            probs = byte_counts / len(data_bytes)
-            probs = probs[probs > 0]
-            byte_entropy = float(-np.sum(probs * np.log2(probs)))
-            data_byte_mean = float(np.mean(data_bytes))
-            data_byte_std = float(np.std(data_bytes))
-            data_byte_min = float(np.min(data_bytes))
-            data_byte_max = float(np.max(data_bytes))
-        else:
-            byte_entropy = 0.0
-            data_byte_mean = 0.0
-            data_byte_std = 0.0
-            data_byte_min = 0.0
-            data_byte_max = 0.0
+    def extract_features(self, frames: List[Dict[str, Any]]) -> np.ndarray:
+        """Extract window-level features from a list of CAN frames.
 
-        return np.array([[
-            0.0, float(dlc), byte_entropy, 1.0,
-            data_byte_mean, data_byte_std, data_byte_min, data_byte_max,
-            1.0 if dlc > 1 else 0.0,
-        ]], dtype=np.float32)
+        P0-05: Uses the shared WindowFeatureExtractor so training and serving
+        produce identical feature names/order/values for identical windows.
 
-    async def predict(self, frame_dict: Dict[str, Any]) -> Tuple[str, float]:
+        Args:
+            frames: List of frame dicts with keys: timestamp, arbitration_id,
+                dlc, data_bytes. All frames should fall within one window.
+
+        Returns:
+            Feature vector as a 2D numpy array (1 row, N features).
+        """
+        if self.feature_extractor is None:
+            self.feature_extractor = WindowFeatureExtractor(window_ms=self.window_ms)
+
+        if not frames:
+            feature_names = self.feature_extractor.feature_names()
+            return np.zeros((1, len(feature_names)), dtype=np.float32)
+
+        # Use the earliest frame timestamp as window start
+        timestamps = [f.get("timestamp", 0.0) for f in frames]
+        window_start_ms = min(timestamps) * 1000.0 if timestamps else 0.0
+
+        feats = self.feature_extractor.extract_window(frames, window_start_ms)
+        feature_names = self.feature_extractor.feature_names()
+        return self.feature_extractor.to_vector(feats, feature_names)
+
+    async def predict_window(
+        self, frames: List[Dict[str, Any]]
+    ) -> Tuple[str, float, Dict[str, Any]]:
+        """Predict on a window of CAN frames.
+
+        Returns (prediction, confidence, features_dict).
+        """
         async with self._lock:
             if not self.is_trained or self.model is None:
                 raise RuntimeError("Model not trained or loaded")
-            X = self.extract_features(frame_dict)
+            X = self.extract_features(frames)
             prediction = self.model.predict(X)[0]
             probabilities = self.model.predict_proba(X)[0]
             confidence = float(np.max(probabilities))
-            return str(prediction), confidence
+
+            # P1-03: Ensemble - use Isolation Forest for anomaly scoring
+            if self.use_ensemble and self.isolation_forest is not None:
+                anomaly_score = self.isolation_forest.decision_function(X)[0]
+                is_anomaly = self.isolation_forest.predict(X)[0] == -1
+                if is_anomaly and prediction == "Normal":
+                    prediction = "Anomaly"
+                    confidence = float(max(confidence, abs(anomaly_score)))
+
+            feature_names = self.feature_extractor.feature_names() if self.feature_extractor else []
+            features_dict = {
+                name: float(X[0][i]) for i, name in enumerate(feature_names)
+            }
+            return str(prediction), confidence, features_dict
+
+    async def predict(self, frame_dict: Dict[str, Any]) -> Tuple[str, float]:
+        """Predict on a single CAN frame (backward compatible).
+
+        Wraps the single frame in a window and delegates to predict_window.
+        """
+        pred, conf, _ = await self.predict_window([frame_dict])
+        return pred, conf
 
     async def predict_batch(self, frames: List[Dict[str, Any]]) -> List[Tuple[str, float]]:
         results = []
