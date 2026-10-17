@@ -37,9 +37,13 @@ models/*.joblib
 *.db
 *.sqlite
 *.sqlite3
+*.db-shm
+*.db-wal
 
 # Docker
 .dockerignore
 
 # Streamlit
 .streamlit/secrets.toml
+# Local audit checkpoint private key
+data/audit_checkpoint_key.pem
