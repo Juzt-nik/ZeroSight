@@ -113,6 +113,9 @@ class AnomalyDetector:
         else:
             event_timestamp = event_timestamp.astimezone(timezone.utc)
 
+        if event_type in {"access_denied", "access_deny"}:
+            outcome = "denial"
+
         action = event_type
         if event_type in {"access_denied", "attack_alert"}:
             recorded_action = details.get("action")
