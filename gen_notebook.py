@@ -132,7 +132,7 @@ except ImportError:
     SKLEARN_AVAILABLE = False
 """))
 
-with open("/Users/aryaverma/Documents/projects/sudoku_daa/ZeroSight/gen_notebook.py", "w") as f:
+with open(os.path.abspath(__file__), "w") as f:
     json.dump(nb, f, indent=2)
 
 print("Part 1 written")

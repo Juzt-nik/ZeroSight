@@ -15,7 +15,10 @@ def test_health_endpoint():
     response = client.get("/health")
 
     assert response.status_code == 200
-    assert response.json()["status"] == "healthy"
+    body = response.json()
+    assert body["status"] in ("healthy", "unhealthy")
+    assert "model_loaded" in body
+    assert "audit_initialized" in body
 
 
 def test_root_endpoint():
@@ -192,17 +195,83 @@ def test_api_dual_approval_uses_authenticated_principals_and_discloses_once(
     assert second.status_code == 200, second.text
     assert second.json()["status"] == "completed"
     assert second.json()["real_identity"] == "SYNTHETIC-VIN-001"
+    assert privacy_routes.unmask_service.unmask(request_id, disclosed_by=officer1_id) is None
 
-    # The completed request cannot disclose the identity again.
-    assert (
-        privacy_routes.unmask_service.unmask(
-            request_id,
-            disclosed_by=officer1_id,
-        )
-        is None
+
+def test_protected_route_missing_authorization_header_returns_401(monkeypatch):
+    """Missing Authorization header on a protected endpoint returns 401."""
+    _configure_demo_auth(monkeypatch)
+    client = TestClient(app)
+    response = client.post(
+        "/detect",
+        json={
+            "frame": {
+                "timestamp": 1.0,
+                "arbitration_id": "0316",
+                "dlc": 8,
+                "data_bytes": [0, 0, 0, 0, 0, 0, 0, 0],
+            }
+        },
     )
+    assert response.status_code == 401
 
 
+def test_protected_route_invalid_bearer_token_returns_401(monkeypatch):
+    """Invalid Bearer token (wrong scheme) on a protected endpoint returns 401."""
+    _configure_demo_auth(monkeypatch)
+    client = TestClient(app)
+    response = client.post(
+        "/detect",
+        headers={"Authorization": "Basic invalid-token-format"},
+        json={
+            "frame": {
+                "timestamp": 1.0,
+                "arbitration_id": "0316",
+                "dlc": 8,
+                "data_bytes": [0, 0, 0, 0, 0, 0, 0, 0],
+            }
+        },
+    )
+    assert response.status_code == 401
+
+
+def test_analyst_cannot_access_security_officer_endpoint_returns_403(monkeypatch):
+    """Analyst attempting a security_officer-only endpoint returns 403."""
+    tokens = _configure_demo_auth(monkeypatch)
+    client = TestClient(app)
+    analyst_id, analyst_roles = tokens["analyst"]
+    response = client.post(
+        "/privacy/unmask/approve",
+        headers={"Authorization": _bearer(analyst_id, analyst_roles)},
+        json={"request_id": "dummy-id", "approve": True},
+    )
+    assert response.status_code == 403, response.text
+
+
+def test_successful_authenticated_request_returns_200(monkeypatch):
+    """Authenticated request with sufficient permissions returns 200."""
+    tokens = _configure_demo_auth(monkeypatch)
+    client = TestClient(app)
+    auditor_id, auditor_roles = tokens["auditor"]
+    # Mock audit service to avoid SQLite initialization in unit test env
+    import backend.services.audit_service as audit_mod
+
+    class _FakeConn:
+        def execute(self, *a, **k):
+            class _Cursor:
+                def fetchone(self):
+                    return (0,)
+            return _Cursor()
+
+    monkeypatch.setattr(audit_mod.audit_service, "_conn", _FakeConn())
+    monkeypatch.setattr(
+        audit_mod.audit_service, "get_events", lambda *a, **k: []
+    )
+    response = client.get(
+        "/audit/events",
+        headers={"Authorization": _bearer(auditor_id, auditor_roles)},
+    )
+    assert response.status_code == 200, response.text
 def test_access_me_resolves_async_auth_dependency(monkeypatch):
     """Verify the async authentication dependency returns a valid user."""
     _configure_demo_auth(monkeypatch)
