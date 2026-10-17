@@ -61,7 +61,7 @@ def scan_config(config_path: Path) -> List[Dict[str, Any]]:
 def generate_cbom(findings: List[Dict[str, Any]]) -> Dict[str, Any]:
     """Generate a CycloneDX-compatible CBOM from scan findings."""
     components = []
-    for i, finding in enumerate(finding):
+    for i, finding in enumerate(findings):
         component = {
             "type": "library",
             "name": finding["component"],

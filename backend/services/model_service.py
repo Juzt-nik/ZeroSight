@@ -97,6 +97,11 @@ class ModelService:
         await self._train_baseline()
     async def _train_baseline(self):
         """Train a RandomForest baseline from Car Hacking CSVs."""
+        model_path = self.model_dir / "baseline_rf.pkl"
+        if_path = self.model_dir / "isolation_forest.pkl"
+        metrics_path = self.model_dir / "metrics.json"
+        metadata_path = self.model_dir / "metadata.json"
+
         csv_files = [
             "DoS_dataset.csv", "Fuzzy_dataset.csv", "gear_dataset.csv",
             "RPM_dataset.csv", "normal_run_data.txt"
