@@ -35,6 +35,7 @@ data/*.zip
 data/raw/
 models/*.pkl
 models/*.joblib
+models/candidates/
 *.db
 *.sqlite
 *.sqlite3
